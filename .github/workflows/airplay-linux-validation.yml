@@ -33,10 +33,9 @@ jobs:
           rustc +1.99.1 --version
           cargo +1.99.1 --version
           git rev-parse HEAD
-      - name: Protocol library tests
-        run: timeout 300s cargo +1.99.1 test --locked -p catplay_carplay --features "${{ matrix.features }}" --lib
-      - name: Protocol integration tests
-        run: timeout 180s cargo +1.99.1 test --locked -p catplay_carplay --features "${{ matrix.features }}" --test '*'
+      - name: Protocol library and integration tests
+        # Report failures across all test binaries in one run.
+        run: timeout 480s cargo +1.99.1 test --locked -p catplay_carplay --features "${{ matrix.features }}" --lib --tests --no-fail-fast
       - name: Build and test receiver probe without starting a listener
         if: matrix.features == 'experimental_airplay_mirroring'
         run: |

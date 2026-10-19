@@ -722,7 +722,13 @@ mod tests {
         };
         sink.set_avcc_config(changed.clone()).await.unwrap();
         assert!(receiver.take_frame().is_none());
-        sink.process_frame(frame(&[&[0x41, 0x80]])).await.unwrap();
+        assert!(matches!(
+            sink.process_frame(frame(&[&[0x41, 0x80]])).await,
+            Err(RtspError::ProtocolViolation("mirror frame config changed without reconfiguration"))
+        ));
+        let mut delta = frame(&[&[0x41, 0x80]]);
+        delta.config = Some(changed.clone());
+        sink.process_frame(delta).await.unwrap();
         assert!(receiver.take_frame().is_none());
         let mut fresh = frame(&[&[0x65, 0x80]]);
         fresh.config = Some(changed.clone());
