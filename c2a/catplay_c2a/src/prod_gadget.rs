@@ -6,6 +6,8 @@ use std::{
 
 #[cfg(feature = "experimental_airplay_mirroring")]
 use catplay_carplay::carplay_rx::{AirPlayReceiverProfile, sink::AirPlayServer};
+#[cfg(feature = "experimental_airplay_mirroring")]
+use catplay_carplay::carplay_tx::AirPlayTransmitter;
 use catplay_carplay::{
     carplay_rx::sink::AirPlayServerShared,
     carplay_tx::{AirPlayTransmitterImpl, AirPlayTransmitterSessionError, TeardownGuard},
