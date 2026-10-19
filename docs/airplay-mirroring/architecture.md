@@ -1,6 +1,6 @@
 # CatPlay AirPlay mirroring architecture review
 
-Status: source review found no remaining blocking issue in continuation revision `70036b874150dbcd5313dc4a30adcf078202db93`. This is not full integration approval. Forty-three portable tests pass, while validation of the changed real receiver, encrypted screen transport and probe on Linux remains pending. The device application still selects CarPlay; no adapter installation or live mirror test has occurred.
+Status: the receiver/probe source has passed independent review and Linux validation at `6af0cb0dfcfdae6e6dcb81420c98cc3711dd9ed3`. The later application checkout at `886bb2ad9b930c14e9a31e54c3671033e7934001` contains the same application code. This supports proceeding to a compatible MIPS build; it does not establish iPhone interoperability, target ABI/timing correctness or vehicle playback. No adapter installation or live mirror test has occurred.
 
 Confirmed target supplied by the user: Carlinkit Mini Ultra1, firmware machine `clk-mini-ultra-nor`, Peugeot e208 GT in the EU, and iPhone Air on iOS 27. The existing working CatPlay installation uses the Ingenic X1600/XBurst MIPS32r2 platform and 16 MiB NOR. A later [read-only baseline](device-baseline.md) measured Linux-visible RAM and idle availability. Radio driver/device IDs were observed; radio performance and memory pressure during streaming remain unmeasured.
 
@@ -113,14 +113,27 @@ The full `catplay_carplay` library test attempt on macOS fails at existing Linux
 
 The original Linux baseline compiled and passed 76 of 77 library tests. Its preexisting `test_drift_effect` expected drift correction while `DISABLE_PLL` was true. The continuation makes a test-only correction that verifies the configured offset-only mapping in both directions, without changing production clock behavior. The baseline result does not validate later source changes.
 
-The current hosted protocol validation is [Actions run 39280539840](https://github.com/keedle/catplay/actions/runs/39280539840) for revision `70036b874150dbcd5313dc4a30adcf078202db93`. At this review checkpoint it was queued without an assigned runner or test logs. Therefore the new real receiver, encrypted screen-codec, C2A lifecycle harness and probe build/test results remain pending. There is no MIPS artifact or device result to approve.
+The completed protocol validation is [Actions run 39280228558](https://github.com/keedle/catplay/actions/runs/39280228558) for `6af0cb0dfcfdae6e6dcb81420c98cc3711dd9ed3` on Ubuntu 24.04. Independent inspection of its downloaded logs confirmed:
+
+| Configuration | Confirmed result |
+| --- | --- |
+| Default CarPlay features | 89 library tests and eight integration tests passed. |
+| Experimental mirroring feature | 95 library tests and eight integration tests passed. |
+| Receiver probe | The Linux example built, and both command-line validation tests passed. No listener was started. |
+| Portable experiments | All 43 policy/source-replay/bridge tests and both synthetic replay executables passed in both jobs. |
+
+The integration results include the actual C2A adapter lifecycle source, real loopback admission and failed-initialization cleanup, the existing transmitter tests, AES receive to `EncodedVideoFrame` to independent ChaCha transmit, controlled timestamp rebasing, and corrupted authentication-tag rejection. The full C2A application and target firmware were not built by this workflow.
+
+The source-equivalence check compared `6af0cb0` with `886bb2a`. The only differences are the workflow runner changing from Ubuntu 24.04 to Ubuntu 22.04 and documentation; no application source, manifest or tests changed. Therefore the successful run applies to the current implementation. The later queued duplicate run did not invalidate that result. Earlier records that marked all protocol validation pending were incorrect and are superseded by this evidence.
+
+The separate [target preflight run 39283164887](https://github.com/keedle/catplay-firmware/actions/runs/39283164887) still had no assigned runner or logs at this checkpoint. GitHub reported [Actions workflow-processing delays](https://www.githubstatus.com/incidents/8tzbpcnl75jp). That target configuration/graph preflight remains unexecuted; there is still no compatible MIPS artifact or physical device result to approve.
 
 ## Hosted target-build direction
 
 The user has no existing SDK or Linux host. Use the personal firmware fork's ordinary hosted workflow for a bounded resource and Yocto parse preflight before attempting compilation. Initialize the firmware's exact recorded gitlinks. The README still names Scarthgap, but `.gitmodules`, layer compatibility declarations and local toolchain adaptations describe the newer pinned tree. Do not substitute README branch names for recorded commit IDs.
 
-The smallest useful target is a probe-only recipe that reuses `c2a-rust-app`, the local CatPlay source-bundle mechanism, `MACHINE=clk-mini-ultra-nor`, `DISTRO=c2a-musl`, and the existing `mips32r2el` tune. It must retain the firmware's Rust standard library and musl, GNU BFD linking for the MIPS executable, static atomic helper linkage and the class's time64 settings. Build only the diagnostic example and collect its ELF metadata, dependency requirements and source/build manifest. Do not add it to machine firmware packages or create an install/reboot/flash step.
+The implemented smallest target is a probe-only recipe that reuses `c2a-rust-app`, the local CatPlay source-bundle mechanism, `MACHINE=clk-mini-ultra-nor`, `DISTRO=c2a-musl`, and the existing `mips32r2el` tune. It must retain the firmware's Rust standard library and musl, GNU BFD linking for the MIPS executable, static atomic helper linkage and the class's time64 settings. Build only the diagnostic example and collect its ELF metadata, dependency requirements and source/build manifest. Do not add it to machine firmware packages or create an install/reboot/flash step.
 
-The first hosted job should record free disk, RAM, CPU count, pinned source revisions, parsed target configuration and dependency graph, with explicit time and disk limits. A later deliberately selected build can use that graph and available cache. No paid runner, full SDK build or complete firmware bundle is assumed. A clean target-toolchain build may exceed the current runner's resources; a preflight result must say so rather than fall back to an ABI-incompatible artifact.
+The preflight workflow records free disk, RAM, CPU count, pinned source revisions, parsed target configuration and dependency graph, with explicit time and disk limits when a runner executes it. A later deliberately selected build can use that graph and available cache. No paid runner, full SDK build or complete firmware bundle is assumed. A clean target-toolchain build may exceed the current runner's resources; a preflight result must say so rather than fall back to an ABI-incompatible artifact.
 
 Do not use `Dockerfile.mips-musl-cargo-test` for a deployable probe. Its own header says `Instant::now()` does not work on the real device. A generic cross-build or QEMU pass cannot replace a matching firmware toolchain, and a matching build still requires a separately authorized physical timing check before a device experiment is considered valid.

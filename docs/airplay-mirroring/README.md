@@ -13,20 +13,25 @@ The target is the user's working Carlinkit Mini Ultra 1, `clk-mini-ultra-nor`, c
 
 CarPlay remains the default and production gadgets do not select the experimental profile. Shared receiver lifecycle and keyframe fixes intentionally affect the default code path too; physical CarPlay regression testing remains outstanding. Firmware recipes and installed service settings are unchanged. The code has no product mode switch. A future UI would select either normal CarPlay or full-picture mirroring and tear down the old phone session before starting the other. Resuming CarPlay requires a fresh session. No same-iPhone dual session, Dashboard window, remote touch or compositor is implied.
 
-## Initial host experiment evidence
+## Host experiment evidence
 
-This table records the first phase. Continuation validation and its scope are recorded in the [receiver probe document](receiver-probe.md) and architecture review.
+This table summarizes host evidence. Full continuation validation and its scope are recorded below, in the [receiver probe document](receiver-probe.md), and in the architecture review.
 
 | Check | Result |
 | --- | --- |
 | Policy unit tests | 15 passed, including 4,112 deterministic arbitrary-input cases inside one test |
-| Imported production converter tests | 17 passed |
+| Imported production video tests | 20 passed, including keyframe detection |
 | New framing tests | 5 passed |
 | Combined policy/converter tests | 3 passed |
 | Both synthetic replay executables | Passed |
 | Full protocol library on macOS | Build blocked by existing Linux-specific tracing APIs |
-| Linux/MIPS application or firmware build | Not performed; matching sysroot/build environment unavailable |
+| Linux receiver probe | Build and CLI tests passed; see continuation evidence below |
+| MIPS application or firmware build | Not performed; matching target artifact remains outstanding |
 | Real iPhone trace, decoder acceptance, device throughput or end-to-end mirroring | Not tested |
+
+The [successful hosted Linux run](https://github.com/keedle/catplay/actions/runs/39280228558) validated revision `6af0cb0dfcfdae6e6dcb81420c98cc3711dd9ed3` on Ubuntu 24.04 with Rust 1.99.1. The default configuration passed 89 library and eight integration tests. The experimental configuration passed 95 library and eight integration tests; its receiver probe built and passed two CLI tests. Both configurations passed the 43 portable tests and both synthetic smoke replays. Integration coverage includes real receiver admission/rollback, C2A disconnect lifecycle, encrypted screen conversion and authentication-tag refusal.
+
+The application code is identical in later revision `886bb2ad9b930c14e9a31e54c3671033e7934001`. The intervening changes affect only the runner image and documentation. Earlier notes incorrectly treated a redundant queued retry as the only current evidence; the archived successful run is authoritative for this application code. These results do not validate MIPS execution, live Apple pairing, a decoder or car playback.
 
 Astra made the architecture decision and independently reviewed source/tests. Sol implemented the protocol policy; Luna mapped firmware/build requirements. Root reviewed their evidence, found the cross-controller lease collision, integrated the replay tests and reran validation.
 

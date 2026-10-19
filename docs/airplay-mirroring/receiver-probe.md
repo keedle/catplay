@@ -29,7 +29,7 @@ The finite duration defaults to 30 seconds and cannot exceed 120 seconds. Ctrl-C
 
 ## Later supervised observation
 
-Running a listener on the working adapter is a separate device-changing test and still requires explicit approval after a target-compatible artifact and rollback procedure exist. No such run is included in this change. A future Linux-host observation also requires deliberately selecting the interface and connecting the test phone to the same reachable network.
+The user has requested a temporary adapter test. It still requires a target-compatible artifact and a concrete cleanup procedure before execution; no such run has occurred. This request does not include firmware flashing, persistent installation or service changes. A future Linux-host observation also requires deliberately selecting the interface and connecting the test phone to the same reachable network.
 
 The invocation shape is:
 
@@ -49,4 +49,8 @@ The first Linux baseline passed 76 of 77 library tests. The existing drift test 
 
 ## Continuation validation record
 
-The portable policy and source-import replay suites pass 43 tests on macOS. The [hosted Linux run](https://github.com/keedle/catplay/actions/runs/39280539840) at `70036b874150dbcd5313dc4a30adcf078202db93` remains queued at the time of this record. Default/experimental protocol tests, localhost admission, encrypted conversion and the probe build are pending. A successful Linux x86_64 result would still leave the [MIPS build](mips-probe-build-plan.md) and physical phone/car tests outstanding.
+The [successful hosted Linux run](https://github.com/keedle/catplay/actions/runs/39280228558) validated revision `6af0cb0dfcfdae6e6dcb81420c98cc3711dd9ed3` on Ubuntu 24.04 with Rust 1.99.1. The default configuration passed 89 library and eight integration tests. The experimental configuration passed 95 library and eight integration tests; its receiver probe built and passed two CLI tests. Both configurations passed the 43 portable tests and both synthetic smoke replays. Integration coverage includes real receiver admission/rollback, C2A disconnect lifecycle, encrypted screen conversion and authentication-tag refusal.
+
+The application code is identical in later revision `886bb2ad9b930c14e9a31e54c3671033e7934001`. The intervening changes affect only the runner image and documentation. Earlier notes incorrectly treated a redundant queued retry as the only current evidence; the archived successful run is authoritative for this application code. These results do not validate MIPS execution, live Apple pairing, a decoder or car playback.
+
+The [MIPS build](mips-probe-build-plan.md) and physical phone/car tests remain outstanding.
