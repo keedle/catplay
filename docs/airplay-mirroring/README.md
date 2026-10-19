@@ -2,7 +2,7 @@
 
 Decision: pursue a constrained H.264 compressed-stream path first. Transcoding has not been shown necessary for this phone and car. The current change is a tested host prototype, not working adapter firmware or an enabled AirPlay receiver.
 
-The target is the user's working Carlinkit Mini Ultra 1, `clk-mini-ultra-nor`, confirmed Ingenic X1600 / AX1800M, paired with a Peugeot e208 GT EU and iPhone Air on iOS 27. A later read-only SSH check measured 55.4 MiB of Linux-visible RAM, about 36.2 MiB available while powered from the Mac, and the current 16 MiB NOR partition layout. No adapter configuration or software was changed. See the [device baseline](device-baseline.md).
+The target is the user's working Carlinkit Mini Ultra 1, `clk-mini-ultra-nor`, confirmed Ingenic X1600 / AX1800M, paired with a Peugeot e208 GT EU and iPhone Air on iOS 27. A later read-only SSH check measured 55.4 MiB of Linux-visible RAM, about 36.2 MiB available while powered from the Mac, and the current 16 MiB NOR partition layout. The user reports firmware v0.17.0; its two release tags match our audited source baselines. No adapter configuration or software was changed. See the [device baseline](device-baseline.md).
 
 ## What is implemented
 

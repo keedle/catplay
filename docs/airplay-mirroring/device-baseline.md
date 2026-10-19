@@ -7,7 +7,7 @@ Observed on 19 October 2026 over SSH, with the Mini Ultra 1 plugged into the Mac
 - Kernel reports `Linux clk-mini-ultra-nor 6.18.36`, MIPS, PREEMPT, build timestamp `Fri Jun 19 17:54:15 UTC 2026`.
 - `/proc/cpuinfo` reports `X1600`, `Carlinkit Mini Ultra (AX1800M)` and Ingenic XBurst with MIPS32r2 support.
 - `/usr/bin/catplay_c2a` is 10,635,616 bytes. SHA-256 is `4cf68394e19c428f9edf70f1c015c1b7c38f2b9965dd1759942b563cb16d6898`.
-- The deployed application's exact source commit is unknown. The kernel build date and binary file timestamp do not establish it. Do not equate this installation with the October upstream checkout.
+- The user identifies the installed firmware as **v0.17.0**. The [published release](https://github.com/catplay-labs/catplay/releases/tag/v0.17.0) and local release tags resolve to app `bc6edae49554f2d0160b18ed18fc7b7376353115` and firmware `aca307bb24efc7b1bcf624625e609a6666970761`, exactly the source baselines audited here. This is release/tag provenance; the installed binary hash has not been compared against the release archive. Kernel build and executable file timestamps alone do not identify its source commit.
 - The CatPlay process is running. The USB gadget reports `configured`; this is the Mac USB connection and does not establish a vehicle CarPlay session.
 - AIC drivers are loaded. SDIO reports `C8A1:0082` with `aicwf_sdio` and `C8A1:0182` with `aicbsp_sdio`. Exact silicon revision and radio performance were not independently established.
 
