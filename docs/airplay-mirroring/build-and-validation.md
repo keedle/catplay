@@ -66,7 +66,7 @@ This is the expected target name based on the checked-in `c2a-system-bundle.bb` 
 
 The CatPlay recipe consumes `meta-catplay/recipes-apps/files/catplay.tar.gz`, not the app Git remote directly. On the future Linux builder, prepare it with `meta-catplay/scripts/create-src-bundle.sh /absolute/path/to/clean/catplay-checkout`, using a clean checkout at the intended app commit. The helper uses GNU tar and only excludes the root target directory; do not package the current tested checkout with nested experiment build directories. Record the generated archive hash. This source bundle was not generated here, and adding the host experiment does not enable a firmware feature.
 
-Before building, check free space and inode capacity for the filesystem hosting `TMPDIR`, downloads, and sstate. The observed Mac had 17 GiB free and is not a practical clean Yocto builder. Use a Linux build host with adequate free space or a prepared cache. The user's adapter is confirmed as Ingenic X1600 AX1800M with 16 MiB NOR; the reported partition sizes are 128 KiB U-Boot, 3 MiB kernel, 9 MiB rootfs, and 3968 KiB userdata. Device RAM and radio capability have not been measured. The checked-in recipe's flash offsets/sizes differ from those user-reported partitions; reconcile this before assessing image fit. Do not infer room for additional media buffers from total NOR or unmeasured RAM.
+Before building, check free space and inode capacity for the filesystem hosting `TMPDIR`, downloads, and sstate. The observed Mac had 17 GiB free and is not a practical clean Yocto builder. Use a Linux build host with adequate free space or a prepared cache. The user's adapter is confirmed as Ingenic X1600 AX1800M with 16 MiB NOR; the current measured CatPlay partitions are 128 KiB U-Boot, 3.5 MiB kernel, 11.5 MiB rootfs and 896 KiB userdata. The earlier 3 MiB/9 MiB/3968 KiB figures came from stock firmware and must not be used as the current layout. The read-only baseline measured 56,692 KiB Linux-visible RAM and 37,036 KiB available while powered from the Mac. Streaming memory pressure and radio performance remain unmeasured. See [device baseline](device-baseline.md).
 
 For every successful build, record:
 
@@ -90,7 +90,7 @@ For each trace, state its origin and stage so data from independent sessions can
 
 ## Later permission-gated manual validation
 
-These stages require a separate explicit go-ahead before touching the working adapter. They are not authorization to run device commands, install packages, reboot, change settings, or flash firmware now.
+These stages involve a changed test build and require a separate explicit go-ahead. The user has authorized read-only SSH inspection, which has now succeeded. That does not authorize installation, reboot, settings changes or flashing.
 
 1. Review the complete diff, host test outcomes, cross-build artifact sizes, partition fit, and rollback/recovery procedure. Stop if any of these are missing.
 2. Get permission for a **temporary, reversible manual test** and agree on the exact adapter, phone, connection sequence, allowed observations, and stop/rollback point.
@@ -100,4 +100,4 @@ These stages require a separate explicit go-ahead before touching the working ad
 
 ## Current validation status
 
-This file records source inspection plus the host test outcomes listed above. All 40 isolated host tests and both replay executables passed on Rust 1.99.1, aarch64-apple-darwin, on 19 October 2026. The full CatPlay protocol suite could not build on this host. Current production integration remains unwired; no adapter operation or flash action is included.
+This file records source inspection plus the host test outcomes listed above. All 40 isolated host tests and both replay executables passed on Rust 1.99.1, aarch64-apple-darwin, on 19 October 2026. The full CatPlay protocol suite could not build on this host. Current production integration remains unwired. A subsequent read-only adapter baseline succeeded; no installation or flash action occurred.

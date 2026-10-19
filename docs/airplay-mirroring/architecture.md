@@ -2,7 +2,7 @@
 
 Status: architecture decision and isolated policy implementation approved for host experimentation. Production integration and device deployment remain unapproved and unverified.
 
-Confirmed target supplied by the user: Carlinkit Mini Ultra1, firmware machine `clk-mini-ultra-nor`, Peugeot e208 GT in the EU, and iPhone Air on iOS 27. The existing working CatPlay installation uses the Ingenic X1600/XBurst MIPS32r2 platform and 16 MiB NOR. Available RAM and radio behavior have not been measured in this task.
+Confirmed target supplied by the user: Carlinkit Mini Ultra1, firmware machine `clk-mini-ultra-nor`, Peugeot e208 GT in the EU, and iPhone Air on iOS 27. The existing working CatPlay installation uses the Ingenic X1600/XBurst MIPS32r2 platform and 16 MiB NOR. A later [read-only baseline](device-baseline.md) measured Linux-visible RAM and idle availability. Radio driver/device IDs were observed; radio performance and memory pressure during streaming remain unmeasured.
 
 Reviewed source snapshots:
 
@@ -69,7 +69,7 @@ A sanitized observation from the iPhone Air on iOS 27 must establish the actual 
 
 The current source parses initial-SETUP stream information and timing-protocol information without showing full support for every possible form. Until a trace resolves this, a production implementation must reject unsupported forms explicitly instead of reporting success without starting a usable stream.
 
-A target build needs the correct MIPS/XBurst configuration and existing firmware dependencies. The hardware identity already provided is sufficient to begin host work. Before a deployment decision, obtain read-only RAM and active memory-pressure evidence and a reproducible baseline build. The 16 MiB NOR layout limits image packaging; it does not reveal available RAM or prove a media queue safe.
+A target build needs the correct MIPS/XBurst configuration and existing firmware dependencies. The hardware identity already provided is sufficient to begin host work. Idle RAM has now been measured; before a deployment decision, obtain active memory-pressure evidence and a reproducible baseline build. The 16 MiB NOR layout limits image packaging; it does not reveal available RAM or prove a media queue safe.
 
 ## Proposed later hardware procedure
 
