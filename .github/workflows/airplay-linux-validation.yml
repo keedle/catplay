@@ -1,0 +1,42 @@
+name: AirPlay Linux validation
+
+on:
+  push:
+    branches: [feature/airplay-mirroring-poc]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: airplay-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  protocol:
+    # This development workflow is scoped to the user's fork.
+    if: github.repository == 'keedle/catplay'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install protocol dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libopus-dev ca-certificates
+          rustup toolchain install 1.99.1 --profile minimal
+      - name: Record toolchain
+        run: |
+          rustc +1.99.1 --version
+          cargo +1.99.1 --version
+          git rev-parse HEAD
+      - name: Protocol library and integration tests
+        run: cargo +1.99.1 test --locked -p catplay_carplay --lib --tests
+      - name: Portable experiments
+        run: |
+          cargo +1.99.1 test --locked --manifest-path experiments/airplay-mirroring/Cargo.toml
+          cargo +1.99.1 test --locked --manifest-path experiments/airplay-video-replay/Cargo.toml
+          cargo +1.99.1 run --locked --manifest-path experiments/airplay-mirroring/Cargo.toml -- --enable-mirroring
+          cargo +1.99.1 run --locked --manifest-path experiments/airplay-video-replay/Cargo.toml
