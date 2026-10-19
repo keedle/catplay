@@ -1,6 +1,6 @@
 # AirPlay mirroring build and validation
 
-This guide records a reproducible validation path for the AirPlay mirroring experiments. Production CatPlay remains CarPlay-only: the receiver gadgets still construct `AirPlayReceiverProfile::CarPlay`, and neither Apple TV selection nor a complete RTSP screen and audio lifecycle is connected to the shipping service. Treat the standalone experiment and replay harness as research tools until the protocol and session blockers are resolved.
+This guide records a reproducible validation path for the AirPlay mirroring experiments. Production CatPlay remains CarPlay-only: the receiver gadgets still construct `AirPlayReceiverProfile::CarPlay`, and the feature-gated picture-only receiver is exposed only by the diagnostic example, not the shipping service. Treat the standalone experiment and replay harness as research tools until the protocol and session blockers are resolved.
 
 ## Source pins and evidence levels
 
@@ -39,7 +39,7 @@ cargo test -p catplay_carplay --lib --locked
 cargo test -p catplay_iap2_link --lib --locked
 ```
 
-Run from `work/catplay`, so the workspace manifest and `Cargo.lock` control dependency selection. The full `cargo test -p catplay_carplay --lib --locked` was attempted on macOS and fails to compile `catplay_tracing` because `lowprio_queue.rs` uses unavailable `SYS_gettid` and a `pthread_setname_np` signature that does not match macOS. This portability issue is recorded and will not be fixed in this effort. The full protocol test suite did not run because its build failed. A passing test does not mean the whole firmware app builds.
+Run from `work/catplay`, so the workspace manifest and `Cargo.lock` control dependency selection. The full `cargo test -p catplay_carplay --lib --locked` was attempted on macOS and fails to compile `catplay_tracing` because `lowprio_queue.rs` uses unavailable `SYS_gettid` and a `pthread_setname_np` signature that does not match macOS. This portability issue is recorded and will not be fixed in this effort. The full protocol test suite did not run on macOS because its build failed. A later Linux validation workflow on the personal fork compiles the actual library; see receiver-probe.md for continuation evidence. A passing test does not mean the whole firmware app builds.
 
 Both experiments are directories committed in the feature branch. Each has a nested Cargo workspace, so invoke it by manifest path from the `work/catplay` root and keep `--locked` to honor that workspace's lockfile:
 
@@ -50,13 +50,13 @@ cargo run --manifest-path experiments/airplay-video-replay/Cargo.toml --locked
 cargo run --manifest-path experiments/airplay-mirroring/Cargo.toml --locked -- --enable-mirroring
 ```
 
-The replay harness passes 17 imported upstream tests, five new framing tests and three combined policy/converter tests. These tests cover video framing/conversion paths; they do not exercise crypto, RTSP negotiation, or a decoder. The standalone policy passes 15 unit tests. Both synthetic replay executables pass. The full CatPlay protocol suite remains unrun because of the build failure above. Label the replay inputs accurately: deterministic generated fixtures are **generated fixture replay**; bytes from an actual device session are **captured trace replay**. Neither label means a full live session succeeded.
+The replay harness passes 20 imported production-source tests, including three new random-access detection tests, five framing tests and three combined policy/converter tests. These tests cover video framing/conversion paths; they do not exercise crypto, RTSP negotiation, or a decoder. The standalone policy passes 15 unit tests. Both synthetic replay executables pass. The full protocol suite cannot run on this Mac; its Linux continuation results are recorded below. Label the replay inputs accurately: deterministic generated fixtures are **generated fixture replay**; bytes from an actual device session are **captured trace replay**. Neither label means a full live session succeeded.
 
 ## Linux/MIPS cross-build and firmware build
 
 The supported product build path is the Yocto recipe, not an ad-hoc Rust target invocation. `meta-catplay/recipes-apps/catplay_git.bb` applies MIPS-specific relocation, BFD linker and `libatomic` flags, and depends on target libraries including multimedia, graphics, D-Bus, USB and OpenSSL. The generic musl Docker test image itself warns that its `Instant::now()` does not work on the physical target. Use the firmware layer's matching MIPS sysroot and compiler for any production app artifact.
 
-The firmware repository README specifies Yocto scarthgap, BitBake 5.0.10, openembedded-core, meta-clang, meta-freescale, and meta-openembedded. The `clk-mini-ultra-nor` machine config selects `catplay` and `catplay-g-iphone`; `c2a-system-bundle.bb` gathers the image, initrd, and kernel outputs. Once the pinned submodules are populated and the documented build environment plus a valid `conf/bblayers.conf` and `conf/local.conf` exist, build with the standard BitBake target:
+The firmware README still names scarthgap and BitBake 5.0.10, but the pinned checkout's `.gitmodules` selects BitBake 2.18 and wrynose for OE-core, meta-clang, meta-openembedded and meta-freescale. Follow the exact gitlink revisions above, not the stale README branch names. The Rust mixin still names scarthgap/rust; its compatibility must be checked during a hosted parse preflight. The `clk-mini-ultra-nor` machine config selects `catplay` and `catplay-g-iphone`; `c2a-system-bundle.bb` gathers the image, initrd, and kernel outputs. Once the pinned submodules are populated and the documented build environment plus a valid `conf/bblayers.conf` and `conf/local.conf` exist, build with the standard BitBake target:
 
 ```sh
 MACHINE=clk-mini-ultra-nor bitbake c2a-system-bundle
@@ -100,4 +100,10 @@ These stages involve a changed test build and require a separate explicit go-ahe
 
 ## Current validation status
 
-This file records source inspection plus the host test outcomes listed above. All 40 isolated host tests and both replay executables passed on Rust 1.99.1, aarch64-apple-darwin, on 19 October 2026. The full CatPlay protocol suite could not build on this host. Current production integration remains unwired. A subsequent read-only adapter baseline succeeded; no installation or flash action occurred.
+All 43 portable tests passed on Rust 1.99.1, aarch64-apple-darwin, on 19 October 2026. Both earlier synthetic replay executables also passed. The full protocol crate cannot build on this Mac because of the Linux-specific tracing code.
+
+The first hosted Linux baseline compiled the protocol library and passed 76 of 77 library tests. The failing test expected PLL drift correction despite the existing production `DISABLE_PLL=true` setting. Its replacement tests the configured offset-only policy without changing production timing logic. A later hosted build found an unsupported `Instant.abs_diff` call in a new integration test; that test now uses explicit duration comparison.
+
+The current Linux workflow tests the default and experimental feature sets, actual receiver admission/cleanup, encrypted screen conversion, and the diagnostic example. Its run at code revision `70036b874150dbcd5313dc4a30adcf078202db93` is queued at the time of this record, so those continuation tests are not yet claimed to pass. Follow the [hosted build](https://github.com/keedle/catplay/actions/runs/39280539840) and retain its completed logs before changing that status.
+
+The user selected hosted builds and has no SDK or separate Linux builder. The [MIPS probe build plan](mips-probe-build-plan.md) records target ABI evidence and the requirements for a firmware-matched build. No MIPS artifact has been built. Vehicle-facing integration remains unwired. Read-only adapter inspection succeeded; no installation, configuration change or flash action occurred.
