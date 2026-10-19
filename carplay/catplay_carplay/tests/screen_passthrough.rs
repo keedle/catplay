@@ -123,7 +123,12 @@ fn aes_to_chacha_preserves_config_pictures_and_reencodes_destination_time() {
         assert_eq!(&delivered.data[..], payload);
         assert_eq!(delivered.config, Some(config.clone()));
         assert_eq!(delivered.is_keyframe, Some(is_idr));
-        assert!(pts.abs_diff(delivered.pts.0) <= Duration::from_nanos(2));
+        let timing_error = if pts >= delivered.pts.0 {
+            pts.duration_since(delivered.pts.0)
+        } else {
+            delivered.pts.0.duration_since(pts)
+        };
+        assert!(timing_error <= Duration::from_nanos(2));
     }
 }
 
