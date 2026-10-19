@@ -11,7 +11,7 @@ The target is the user's working Carlinkit Mini Ultra 1, `clk-mini-ultra-nor`, c
 - A feature-gated picture-only receiver profile and bounded metadata probe, plus shared session-admission, cleanup and keyframe fixes.
 - A source audit, architecture decision, integration sequence and reproducible host commands.
 
-CarPlay remains the default. A feature-enabled application now offers a separate explicit process startup mode for experimental screen and media-audio mirroring; see [integrated mode](integrated-mode.md). Shared receiver lifecycle and keyframe fixes intentionally affect the default code path too; physical CarPlay regression testing remains outstanding. Firmware recipes and installed service settings are unchanged. There is no dashboard mode switch. The experimental launch options select mirroring for the process lifetime; returning to normal CarPlay requires a fresh normal application session. No same-iPhone dual session, Dashboard window, remote touch or compositor is implied.
+CarPlay remains the default. A feature-enabled application now offers a separate explicit process startup mode for experimental screen and media-audio mirroring; see [integrated mode](integrated-mode.md). Shared receiver lifecycle and keyframe fixes intentionally affect the default code path too; physical CarPlay regression testing remains outstanding. Separate artifact-only build recipes are provided; installed firmware and service settings remain unchanged. There is no dashboard mode switch. The experimental launch options select mirroring for the process lifetime; returning to normal CarPlay requires a fresh normal application session. No same-iPhone dual session, Dashboard window, remote touch or compositor is implied.
 
 ## Host experiment evidence
 

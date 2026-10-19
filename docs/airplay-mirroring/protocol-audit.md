@@ -1,5 +1,9 @@
 # CatPlay AirPlay mirroring protocol audit
 
+Continuation note: this document retains the earlier audit/build history. See
+[integrated mode](integrated-mode.md) for the current screen/audio implementation
+and validation scope. Earlier statements about pending integration are historical.
+
 Read-only source audit at upstream `bc6edae49554f2d0160b18ed18fc7b7376353115`, branch `feature/airplay-mirroring-poc`, 19 October 2026. Paths below are relative to the CatPlay repository root. This source audit preceded the later [read-only device baseline](device-baseline.md). No flashing occurred. Source implementation is evidence of code, not proof that a current iPhone and this head unit complete the exchange.
 
 ## Finding

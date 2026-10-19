@@ -1,5 +1,9 @@
 # AirPlay mirroring build and validation
 
+Continuation note: this document retains the earlier audit/build history. See
+[integrated mode](integrated-mode.md) for the current screen/audio implementation
+and validation scope. Earlier statements about pending integration are historical.
+
 This guide records a reproducible validation path for the AirPlay mirroring experiments. Default CatPlay startup remains CarPlay. A feature-enabled build now has an explicit experimental process mode connecting the picture-only receiver to the car-facing transmitter; see [integrated mode](integrated-mode.md). Full application CI and physical validation of this continuation remain pending. Treat the standalone experiment and replay harness as research tools until the protocol and session blockers are resolved.
 
 ## Source pins and evidence levels

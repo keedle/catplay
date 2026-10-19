@@ -1732,7 +1732,16 @@ mod tests {
         assert!(!receiver.profile.is_picture_only());
         assert_eq!(
             receiver.mirroring_audio_formats,
-            AudioFormat::PCM_44100_STEREO | AudioFormat::PCM_48000_STEREO
+            AudioFormat::PCM_44100_STEREO
+                | AudioFormat::PCM_48000_STEREO
+                | AudioFormat::AAC_LC_44100_STEREO
+                | AudioFormat::AAC_LC_48000_STEREO
+                | AudioFormat::AAC_ELD_44100_STEREO
+                | AudioFormat::AAC_ELD_48000_STEREO
+                | AudioFormat::ALAC_44100_16_STEREO
+                | AudioFormat::ALAC_44100_24_STEREO
+                | AudioFormat::ALAC_48000_16_STEREO
+                | AudioFormat::ALAC_48000_24_STEREO
         );
     }
 

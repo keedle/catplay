@@ -1,5 +1,9 @@
 # MIPS build plan for the AirPlay receiver probe
 
+Continuation note: this document retains the earlier audit/build history. See
+[integrated mode](integrated-mode.md) for the current screen/audio implementation
+and validation scope. Earlier statements about pending integration are historical.
+
 This is a build-only plan for the experimental receiver metadata probe at `work/catplay/carplay/catplay_carplay/examples/airplay_mirror_probe.rs`. It does not authorize starting the listener on the adapter, installing an artifact, changing settings, or flashing firmware.
 
 ## Source and target facts

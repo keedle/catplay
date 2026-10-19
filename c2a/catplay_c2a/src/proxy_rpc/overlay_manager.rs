@@ -502,6 +502,7 @@ mod mirror_forwarding_tests {
         screen::{rx::ScreenReceiverSink, tx::ScreenTransmitOp},
         video::{AvccConfig, AvccConfigExtended, Pts},
     };
+    use catplay_util::AsyncShutdown;
     use std::{
         collections::VecDeque,
         sync::atomic::{AtomicUsize, Ordering},

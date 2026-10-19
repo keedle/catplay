@@ -632,7 +632,7 @@ mod tests {
         clock::{MediaClock, NtpU64},
         screen::{
             ScreenFrame,
-            tx::{ScreenTransmitOp, ScreenTransmitProxy},
+            tx::{ScreenTransmitOp, ScreenTransmitProxy, ScreenTransmitSink},
         },
         video::{AvccConfig, Pts},
     };

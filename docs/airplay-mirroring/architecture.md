@@ -1,5 +1,9 @@
 # CatPlay AirPlay mirroring architecture review
 
+Continuation note: this document retains the earlier audit/build history. See
+[integrated mode](integrated-mode.md) for the current screen/audio implementation
+and validation scope. Earlier statements about pending integration are historical.
+
 Status: the receiver/probe source has passed independent review and Linux validation at `6af0cb0dfcfdae6e6dcb81420c98cc3711dd9ed3`. The later application checkout at `886bb2ad9b930c14e9a31e54c3671033e7934001` contains the same application code. This supports proceeding to a compatible MIPS build; it does not establish iPhone interoperability, target ABI/timing correctness or vehicle playback. No adapter installation or live mirror test has occurred.
 
 Confirmed target supplied by the user: Carlinkit Mini Ultra1, firmware machine `clk-mini-ultra-nor`, Peugeot e208 GT in the EU, and iPhone Air on iOS 27. The existing working CatPlay installation uses the Ingenic X1600/XBurst MIPS32r2 platform and 16 MiB NOR. A later [read-only baseline](device-baseline.md) measured Linux-visible RAM and idle availability. Radio driver/device IDs were observed; radio performance and memory pressure during streaming remain unmeasured.
