@@ -1,0 +1,15 @@
+[package]
+name = "catplay-airplay-mirroring-experiment"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately isolated from the firmware's native/system dependencies.
+[workspace]
+
+[lib]
+name = "airplay_mirroring_experiment"
+
+[[bin]]
+name = "mirror-replay"
+path = "src/main.rs"

@@ -1,0 +1,16 @@
+[package]
+name = "catplay-airplay-video-replay"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Keep this host-only source replay outside the Linux production workspace.
+[workspace]
+
+[dependencies]
+bytes = "=1.10.1"
+log = "=0.4.27"
+exp-golomb = "=0.1.0"
+
+[dev-dependencies]
+airplay_mirroring_experiment = { package = "catplay-airplay-mirroring-experiment", path = "../airplay-mirroring" }
