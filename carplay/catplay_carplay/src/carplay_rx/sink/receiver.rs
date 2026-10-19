@@ -278,7 +278,11 @@ impl AirPlayReceiver {
             && let Err(error) = screen.reconcile().await
         {
             self.sink
-                .on_receiver_diagnostic(AirPlayReceiverDiagnostic::ScreenTerminated);
+                .on_receiver_diagnostic(if matches!(&error, Some(RtspError::PayloadTooBig(..))) {
+                    AirPlayReceiverDiagnostic::ScreenPayloadTooLarge
+                } else {
+                    AirPlayReceiverDiagnostic::ScreenTerminated
+                });
             return Err(error.unwrap_or(RtspError::Closed));
         }
         Ok(())
@@ -320,10 +324,50 @@ impl AirPlayReceiver {
             (Get, _) => Err(HttpStatus::NotFound)?,
 
             // Posts
-            (Post, "/pair-setup") => self.pairing.respond_pair_setup(req, resp).await?,
-            (Post, "/pair-verify") => self.pairing.respond_pair_verify(req, resp).await?,
-            (Post, "/auth-setup") => self.pairing.respond_auth_setup(req, resp).await?,
-            (Post, "/fp-setup") => self.pairing.respond_fp_setup(req, resp)?,
+            (Post, "/pair-setup") => {
+                let result = self.pairing.respond_pair_setup(req, resp).await;
+                if self.profile.is_picture_only() {
+                    self.sink.on_receiver_diagnostic(if result.is_ok() {
+                        AirPlayReceiverDiagnostic::PairSetupHandlerCompleted
+                    } else {
+                        AirPlayReceiverDiagnostic::PairSetupHandlerFailed
+                    });
+                }
+                result?;
+            }
+            (Post, "/pair-verify") => {
+                let result = self.pairing.respond_pair_verify(req, resp).await;
+                if self.profile.is_picture_only() {
+                    self.sink.on_receiver_diagnostic(if result.is_ok() {
+                        AirPlayReceiverDiagnostic::PairVerifyHandlerCompleted
+                    } else {
+                        AirPlayReceiverDiagnostic::PairVerifyHandlerFailed
+                    });
+                }
+                result?;
+            }
+            (Post, "/auth-setup") => {
+                let result = self.pairing.respond_auth_setup(req, resp).await;
+                if self.profile.is_picture_only() {
+                    self.sink.on_receiver_diagnostic(if result.is_ok() {
+                        AirPlayReceiverDiagnostic::AuthSetupHandlerCompleted
+                    } else {
+                        AirPlayReceiverDiagnostic::AuthSetupHandlerFailed
+                    });
+                }
+                result?;
+            }
+            (Post, "/fp-setup") => {
+                let result = self.pairing.respond_fp_setup(req, resp);
+                if self.profile.is_picture_only() {
+                    self.sink.on_receiver_diagnostic(if result.is_ok() {
+                        AirPlayReceiverDiagnostic::FairPlayHandlerCompleted
+                    } else {
+                        AirPlayReceiverDiagnostic::FairPlayHandlerFailed
+                    });
+                }
+                result?;
+            }
 
             (Post, "/command") => self.respond_command(req, resp).await?,
             (Post, "/diag-info") => Err(HttpStatus::NotFound)?,
@@ -720,6 +764,12 @@ impl AirPlayReceiver {
             screen_sink,
             media_clock.boxed(),
         );
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        let recv = if self.profile.is_picture_only() {
+            recv.with_max_payload_size(crate::carplay_rx::AIRPLAY_MIRRORING_MAX_SCREEN_PAYLOAD)?
+        } else {
+            recv
+        };
 
         let (helper, local) = spawn_fork("screen_rx", move || {
             TcpHelper::accept_timeout(bind_ip, Self::TCP_REVERSE_CONN_TIMEOUT, recv)
@@ -1364,6 +1414,41 @@ mod tests {
                 | AirPlayFeature::AUTHENTICATION4
                 | AirPlayFeature::SUPPORTS_SCREEN_MULTI_CODEC
         );
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    #[tokio::test]
+    async fn pairing_handler_diagnostics_are_allowlisted_and_picture_only() {
+        for profile in [AirPlayReceiverProfile::AppleTV, AirPlayReceiverProfile::AppleTVH264VideoOnly] {
+            let (mut receiver, calls) = receiver(profile, AirPlayServerShared::new(), false, false);
+            let mut response = RtspResponse::new(None, HttpStatus::Ok);
+            let invalid = RtspRequest::post("/fp-setup", bytes::BytesMut::new());
+            assert!(
+                receiver
+                    .process_request(&invalid, &mut response)
+                    .await
+                    .is_err()
+            );
+            let mut payload = [0u8; 16];
+            payload[4] = 3;
+            let valid = RtspRequest::post("/fp-setup", bytes::BytesMut::from(&payload[..]));
+            receiver
+                .process_request(&valid, &mut response)
+                .await
+                .unwrap();
+            let calls = calls.lock().unwrap();
+            if profile.is_picture_only() {
+                assert_eq!(
+                    calls.diagnostics,
+                    [
+                        AirPlayReceiverDiagnostic::FairPlayHandlerFailed,
+                        AirPlayReceiverDiagnostic::FairPlayHandlerCompleted
+                    ]
+                );
+            } else {
+                assert!(calls.diagnostics.is_empty());
+            }
+        }
     }
 
     #[cfg(feature = "experimental_airplay_mirroring")]

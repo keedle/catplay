@@ -26,6 +26,7 @@ pub struct ScreenReceiverSession {
     negative_ahead_frames: u32,
     late_frames: u32,
     display_delta_ms: i64,
+    max_payload_size: usize,
 }
 
 impl ScreenReceiverSession {
@@ -48,7 +49,17 @@ impl ScreenReceiverSession {
             negative_ahead_frames: 0,
             late_frames: 0,
             display_delta_ms: 0,
+            max_payload_size: ScreenFrameCodec::MAX_PAYLOAD_SIZE,
         }
+    }
+
+    /// Set a stricter receiver wire-body bound without changing legacy defaults.
+    pub fn with_max_payload_size(mut self, limit: usize) -> RtspResult<Self> {
+        if !(1..=ScreenFrameCodec::MAX_PAYLOAD_SIZE).contains(&limit) {
+            return Err(RtspError::ProtocolViolation("invalid screen payload limit"));
+        }
+        self.max_payload_size = limit;
+        Ok(self)
     }
 }
 
@@ -58,12 +69,13 @@ impl TcpSession for ScreenReceiverSession {
     type Error = RtspError;
 
     fn init_codec(&mut self) -> RtspResult<ScreenFrameCodec> {
-        Ok(ScreenFrameCodec::new_with_flags(
+        ScreenFrameCodec::new_with_flags(
             self.cipher,
             self.stream_connection_id,
             true,
             ScreenFrameCodecFlags::crate_defaults(),
-        ))
+        )
+        .with_max_payload_size(self.max_payload_size)
     }
 
     async fn on_msg(&mut self, _sink: &mut dyn TcpSink<Self>, msg: CItem<Self::Codec>) -> RtspResult<()> {

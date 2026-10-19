@@ -147,10 +147,11 @@ pub struct ScreenFrameCodec {
     crypto: Option<ScreenFrameCodecCrypto>,
     pub chunks_rx: usize,
     flags: ScreenFrameCodecFlags,
+    max_payload_size: usize,
 }
 
 impl ScreenFrameCodec {
-    const MAX_PAYLOAD_SIZE: usize = 4 * 1024 * 1024; // 4MB
+    pub const MAX_PAYLOAD_SIZE: usize = 4 * 1024 * 1024; // legacy hard ceiling
     const CHACHA_TAG_LEN: usize = 16;
 
     /// An estimated maximum frame size; a bigger buffer does not result in CPU overhead, only reserves memory.
@@ -219,6 +220,7 @@ impl ScreenFrameCodec {
                 frame_size_tx: guesstimator,
             }),
             chunks_rx: 0,
+            max_payload_size: Self::MAX_PAYLOAD_SIZE,
             flags,
         }
     }
@@ -252,6 +254,7 @@ impl ScreenFrameCodec {
             header: None,
             crypto: Some(ScreenFrameCodecCrypto::AesCtr { read_cipher, write_cipher }),
             chunks_rx: 0,
+            max_payload_size: Self::MAX_PAYLOAD_SIZE,
             flags,
         }
     }
@@ -261,8 +264,19 @@ impl ScreenFrameCodec {
             header: None,
             crypto: None,
             chunks_rx: 0,
+            max_payload_size: Self::MAX_PAYLOAD_SIZE,
             flags: ScreenFrameCodecFlags::empty(),
         }
+    }
+
+    /// Reduce the accepted wire-body size. Includes the authentication tag when
+    /// present. Does not bound other socket, codec or consumer allocations.
+    pub fn with_max_payload_size(mut self, limit: usize) -> RtspResult<Self> {
+        if !(1..=Self::MAX_PAYLOAD_SIZE).contains(&limit) {
+            return Err(RtspError::ProtocolViolation("invalid screen payload limit"));
+        }
+        self.max_payload_size = limit;
+        Ok(self)
     }
 
     fn is_chacha(&self) -> bool {
@@ -429,8 +443,8 @@ impl ScreenFrameCodec {
                 self.decode(src)
             }
             Some((mut header, mut decrypt_nonce, mut decrypted_payload_len)) => {
-                if header.body_size > Self::MAX_PAYLOAD_SIZE as _ {
-                    return Err(RtspError::PayloadTooBig(header.body_size as _, Self::MAX_PAYLOAD_SIZE));
+                if header.body_size > self.max_payload_size as _ {
+                    return Err(RtspError::PayloadTooBig(header.body_size as _, self.max_payload_size));
                 }
 
                 let header_size = ScreenFrameHeader::size();
@@ -655,6 +669,44 @@ mod tests {
     };
 
     use super::FrameSizeGuesstimator;
+
+    #[test]
+    fn stricter_ingress_cap_rejects_header_before_body_allocation() {
+        use crate::rtsp_frame::RtspError;
+        use catplay_tokio::Decoder;
+        let limit = 1024 * 1024;
+        let mut header = ScreenFrameHeader::default();
+        header.opcode = ScreenOpCode::VideoFrame;
+        header.body_size = (limit + 1) as _;
+        let mut input = BytesMut::with_capacity(ScreenFrameHeader::size());
+        header.write(&mut input);
+        let capacity = input.capacity();
+        let mut bounded = ScreenFrameCodec::aes([0x11; 16], 101, true)
+            .with_max_payload_size(limit)
+            .unwrap();
+        assert!(matches!(bounded.decode(&mut input), Err(RtspError::PayloadTooBig(size, cap)) if size == limit + 1 && cap == limit));
+        assert_eq!(input.capacity(), capacity);
+        assert_eq!(input.len(), ScreenFrameHeader::size());
+
+        // Legacy callers still accept this size under their unchanged 4 MiB cap.
+        let mut legacy = ScreenFrameCodec::unencrypted();
+        assert_eq!(legacy.max_payload_size, 4 * 1024 * 1024);
+        assert!(legacy.decode(&mut input).unwrap().is_none());
+    }
+
+    #[test]
+    fn ingress_cap_cannot_be_zero_or_exceed_legacy_ceiling() {
+        assert!(
+            ScreenFrameCodec::unencrypted()
+                .with_max_payload_size(0)
+                .is_err()
+        );
+        assert!(
+            ScreenFrameCodec::unencrypted()
+                .with_max_payload_size(ScreenFrameCodec::MAX_PAYLOAD_SIZE + 1)
+                .is_err()
+        );
+    }
 
     #[test]
     fn test_frame_size_ewma_and_chacha_prefetch_bounds() {

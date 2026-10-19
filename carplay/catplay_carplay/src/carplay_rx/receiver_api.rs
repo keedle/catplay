@@ -77,8 +77,7 @@ impl AirPlayReceiverProfile {
     }
 }
 
-/// Safe shape of a picture-only initial SETUP. It intentionally excludes all
-/// sender identity, key material, session IDs and request payload bytes.
+/// Allowlisted timing protocol labels for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AirPlayObservedTimingProtocol {
     Absent,
@@ -87,6 +86,7 @@ pub enum AirPlayObservedTimingProtocol {
     Other,
 }
 
+/// Safe SETUP shape, without identity, key material, session IDs or raw bytes.
 #[derive(Debug, Clone)]
 pub struct AirPlayInitialSetupObservation {
     pub timing_protocol: AirPlayObservedTimingProtocol,
@@ -106,7 +106,23 @@ pub enum AirPlayReceiverDiagnostic {
     MissingMediaEncryption,
     InitialSetupFailed,
     ScreenTerminated,
+    ScreenPayloadTooLarge,
+    // A completed handler is only one request, not proof of authentication or
+    // an established AirPlay session. HAP can return a TLV error with HTTP 200.
+    PairSetupHandlerCompleted,
+    PairSetupHandlerFailed,
+    PairVerifyHandlerCompleted,
+    PairVerifyHandlerFailed,
+    FairPlayHandlerCompleted,
+    FairPlayHandlerFailed,
+    AuthSetupHandlerCompleted,
+    AuthSetupHandlerFailed,
 }
+
+/// Maximum wire-body size for the opt-in receiver, including an authentication
+/// tag where applicable. This is not a total process-memory bound.
+#[cfg(feature = "experimental_airplay_mirroring")]
+pub const AIRPLAY_MIRRORING_MAX_SCREEN_PAYLOAD: usize = 1024 * 1024;
 
 /// Informations needed to bootstrap AirPlay receiver session.
 pub struct AirPlayReceiverBootstrap {

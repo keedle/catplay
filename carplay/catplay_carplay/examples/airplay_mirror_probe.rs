@@ -9,7 +9,8 @@ use std::{
 use async_trait::async_trait;
 use catplay_carplay::{
     carplay_rx::{
-        AirPlayInitialSetupObservation, AirPlayReceiverDiagnostic, AirPlayReceiverHandleRef, AirPlayReceiverProfile, AirPlayReceiverSink,
+        AIRPLAY_MIRRORING_MAX_SCREEN_PAYLOAD, AirPlayInitialSetupObservation, AirPlayReceiverDiagnostic, AirPlayReceiverHandleRef,
+        AirPlayReceiverProfile, AirPlayReceiverSink,
         sink::{AirPlayServer, AirPlayServerShared},
     },
     msg::{Display, InfoMessageResponse},
@@ -292,8 +293,8 @@ async fn run(options: Options) -> Result<(), &'static str> {
     server.bind().await.map_err(|_| "bind")?;
     server.start_advertise().map_err(|_| "discovery")?;
     println!(
-        "probe_listening port=7001 seconds={} requested_width={} requested_height={} storage=in_memory audio=refused forwarding=none",
-        options.seconds, options.width, options.height
+        "probe_listening port=7001 seconds={} requested_width={} requested_height={} max_screen_wire_body_bytes={} storage=in_memory audio=refused forwarding=none",
+        options.seconds, options.width, options.height, AIRPLAY_MIRRORING_MAX_SCREEN_PAYLOAD
     );
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_secs(options.seconds)) => {},
