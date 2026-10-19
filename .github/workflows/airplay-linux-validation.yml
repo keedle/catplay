@@ -8,10 +8,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: airplay-linux-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   protocol:
     # This development workflow is scoped to the user's fork.
