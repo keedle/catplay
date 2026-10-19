@@ -10,6 +10,7 @@ default = ["jemalloc", "ui"]
 ui = []
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
 mimalloc = ["dep:mimalloc"]
+experimental_airplay_mirroring = ["catplay_carplay/experimental_airplay_mirroring"]
 
 [dependencies]
 

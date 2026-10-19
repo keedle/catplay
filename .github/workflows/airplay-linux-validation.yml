@@ -47,3 +47,36 @@ jobs:
           cargo +1.99.1 test --locked --manifest-path experiments/airplay-video-replay/Cargo.toml
           cargo +1.99.1 run --locked --manifest-path experiments/airplay-mirroring/Cargo.toml -- --enable-mirroring
           cargo +1.99.1 run --locked --manifest-path experiments/airplay-video-replay/Cargo.toml
+
+  application:
+    if: github.repository == 'keedle/catplay'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", experimental_airplay_mirroring]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install application build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake nasm clang libclang-dev libssl-dev libopus-dev libdbus-1-dev libusb-1.0-0-dev libpixman-1-dev libx264-dev libyuv-dev ca-certificates
+          rustup toolchain install 1.99.1 --profile minimal
+      - name: Build pinned host JPEG library
+        # The application uses the TurboJPEG 3 API; Ubuntu 22.04 ships version 2.
+        run: |
+          curl --fail --location --retry 3 --max-time 120 https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/3.0.1.tar.gz --output "$RUNNER_TEMP/jpeg.tar.gz"
+          echo "5b9bbca2b2a87c6632c821799438d358e27004ab528abf798533c15d50b39f82  $RUNNER_TEMP/jpeg.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/jpeg.tar.gz" -C "$RUNNER_TEMP"
+          cmake -S "$RUNNER_TEMP/libjpeg-turbo-3.0.1" -B "$RUNNER_TEMP/jpeg-build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/jpeg" -DCMAKE_INSTALL_LIBDIR=lib -DENABLE_SHARED=ON -DENABLE_STATIC=OFF
+          cmake --build "$RUNNER_TEMP/jpeg-build" --parallel 2
+          cmake --install "$RUNNER_TEMP/jpeg-build"
+          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/jpeg/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/jpeg/lib" >> "$GITHUB_ENV"
+      - name: Build the integrated application without starting it
+        run: timeout 900s cargo +1.99.1 build --locked -p catplay_c2a --features "${{ matrix.features }}" --bins
+      - name: Application lifecycle and video tests
+        run: timeout 300s cargo +1.99.1 test --locked -p catplay_c2a --features "${{ matrix.features }}" --lib

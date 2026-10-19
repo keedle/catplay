@@ -39,6 +39,14 @@ pub struct OverlayManager {
 
     renderer: Option<Arc<Mutex<UiRenderer>>>,
 
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    mirror_peer: Option<AirPlayReceiverHandleRef>,
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    mirror_mode: bool,
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    mirror_screen: Option<super::MirrorBridgeReceiver>,
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    mirror_last_config: Option<catplay_carplay::video::AvccConfigExtended>,
     policy: OverlayPolicyDefault,
     // stream_state: ResourceTransferType,
 }
@@ -63,9 +71,108 @@ impl OverlayManager {
 
             renderer: None,
 
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            mirror_peer: None,
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            mirror_mode: false,
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            mirror_screen: None,
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            mirror_last_config: None,
             policy: OverlayPolicyDefault::new(),
             lazy_screen: None,
         }
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn enable_mirroring(&mut self) {
+        self.mirror_mode = true;
+        self.clear_render_queue();
+        self.overlay_current = None;
+        self.overlay_last_keyframe = None;
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn set_mirror_peer(&mut self, handle: Option<AirPlayReceiverHandleRef>) {
+        if let Some(mut screen) = self.mirror_screen.take() {
+            screen.close();
+        }
+        self.mirror_peer = handle;
+        self.mirror_last_config = None;
+        self.clear_render_queue();
+        self.overlay_current = None;
+        self.overlay_last_keyframe = None;
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn set_mirror_screen(&mut self, receiver: super::MirrorBridgeReceiver) {
+        if let Some(mut old) = self.mirror_screen.take() {
+            old.close();
+        }
+        self.mirror_screen = Some(receiver);
+        self.mirror_last_config = None;
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn fail_mirror_stream(&mut self) {
+        if let Some(screen) = self.mirror_screen.as_mut() {
+            screen.close();
+        }
+        if let Some(handle) = self.mirror_peer.as_ref() {
+            handle.close(catplay_carplay::rtsp_frame::RtspError::NotSupported);
+        }
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    async fn reconcile_mirror(&mut self) {
+        let Some(receiver) = self.mirror_screen.as_mut() else {
+            return;
+        };
+        if receiver.is_closed() {
+            if let Some(handle) = self.mirror_peer.as_ref() {
+                handle.close(catplay_carplay::rtsp_frame::RtspError::Closed);
+            }
+            self.mirror_screen.take();
+            return;
+        }
+        let Some(screen) = self.lazy_screen.as_mut() else {
+            return;
+        };
+        // Do not hand a frame to the legacy queue while it is at its limit.
+        // This confines mirror queue memory to a fixed frame count, each gated
+        // by the receiver's byte bound, and avoids blocking the car event loop.
+        if screen.queue_len() >= screen.queue_max().min(2) {
+            return;
+        }
+        let Some((revision, frame)) = receiver.take_frame_tagged() else {
+            return;
+        };
+        if !receiver.is_revision_current(revision) {
+            return;
+        }
+        if frame.config.is_some() && self.mirror_last_config.is_some() && self.mirror_last_config != frame.config {
+            // A new stream cannot share queued media or cached state with the
+            // prior configuration. Dropping the guard schedules real TEARDOWN.
+            self.lazy_screen.take();
+            self.mirror_last_config = None;
+            self.fail_mirror_stream();
+            return;
+        }
+        if let Some(config) = frame.config.as_ref() {
+            self.mirror_last_config = Some(config.clone());
+        }
+        let result = tokio::time::timeout(Duration::from_millis(100), screen.push_frame(frame)).await;
+        if !matches!(result, Ok(Ok(()))) {
+            self.fail_mirror_stream();
+        }
+    }
+
+    /// Retire downstream state from a previous owner without failing the
+    /// current phone, which may already be a newly admitted successor.
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn retire_mirror_car_stream(&mut self) {
+        self.mirror_last_config = None;
+        self.lazy_screen.take();
     }
 
     pub fn set_car_peer(&mut self, lazy_screen: TeardownGuard<ScreenTransmitProxy>) {
@@ -73,6 +180,13 @@ impl OverlayManager {
     }
 
     pub fn drop_car_peer(&mut self) -> Option<TeardownGuard<ScreenTransmitProxy>> {
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        {
+            self.mirror_last_config = None;
+            if self.lazy_screen.is_some() {
+                self.fail_mirror_stream();
+            }
+        }
         self.lazy_screen.take()
     }
 
@@ -268,12 +382,22 @@ impl OverlayManager {
     }
 
     pub async fn reconcile(&mut self) {
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        if self.mirror_mode {
+            self.reconcile_mirror().await;
+            return;
+        }
         self.reconcile_overlay_frame().await;
         self.reconcile_overlay_next().await;
         self.reconcile_screen_iphone().await;
     }
 
     pub fn force_keyframe(&mut self) {
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        if self.mirror_peer.is_some() {
+            self.fail_mirror_stream();
+            return;
+        }
         if let Some(iphone) = self.iphone_peer.as_ref() {
             iphone.request_keyframe();
         } else if let Some(a) = self.lazy_screen.as_mut()
@@ -289,6 +413,19 @@ impl OverlayManager {
 
 impl EventSleeper for OverlayManager {
     async fn sleep(&mut self) -> Option<EventToken> {
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        if self.mirror_mode {
+            let can_forward = self
+                .lazy_screen
+                .as_ref()
+                .is_some_and(|screen| screen.queue_len() < screen.queue_max().min(2));
+            if can_forward {
+                return event_select!(self.mirror_screen, deadline(Instant::now() + Duration::from_millis(20)));
+            }
+            return deadline(Instant::now() + Duration::from_millis(20))
+                .sleep()
+                .await;
+        }
         event_select!(
             self.policy,
             self.overlay_render_queue,
@@ -310,4 +447,200 @@ pub trait OverlayPolicy: EventReconciler<Error = ()> + EventSleeper {
     fn overlay(&mut self) -> Option<UiState>;
 
     fn on_hid_interact(&mut self) -> bool;
+}
+
+#[cfg(all(test, feature = "experimental_airplay_mirroring"))]
+mod mirror_forwarding_tests {
+    use super::*;
+    use crate::proxy_rpc::{MirrorBridge, MirrorLimits};
+    use bytes::BytesMut;
+    use catplay_carplay::{
+        carplay_rx::{AirPlayReceiverProfile, sink::AirPlayReceiverHandleImpl},
+        clock::TimingClient,
+        screen::{rx::ScreenReceiverSink, tx::ScreenTransmitOp},
+        video::{AvccConfig, AvccConfigExtended, Pts},
+    };
+    use std::{
+        collections::VecDeque,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    fn handle() -> AirPlayReceiverHandleRef {
+        Arc::new(AirPlayReceiverHandleImpl::new_with_profile(
+            None,
+            TimingClient::new().1,
+            mpsc::unbounded().0,
+            "lo",
+            true,
+            mpsc::channel(1).0,
+            AirPlayReceiverProfile::AppleTVH264VideoOnly,
+        ))
+    }
+    fn config() -> AvccConfigExtended {
+        AvccConfigExtended {
+            hevc: false,
+            avcc: AvccConfig {
+                nal_size_len: 4,
+                sps_pps: vec![0, 0, 0, 1, 0x67, 66, 0, 31, 0, 0, 0, 1, 0x68, 0],
+            },
+            width: 800,
+            height: 480,
+            video_latency: Duration::ZERO,
+            respect_timestamps: true,
+        }
+    }
+    fn frame(idr: bool) -> EncodedVideoFrame {
+        EncodedVideoFrame {
+            pts: Pts(Instant::now()),
+            width: 800,
+            height: 480,
+            data: BytesMut::from(if idr {
+                &b"\0\0\0\x01\x65\x01"[..]
+            } else {
+                &b"\0\0\0\x01\x41\x01"[..]
+            }),
+            config: Some(config()),
+            nal_offsets: None,
+            is_keyframe: Some(false),
+            header_buf: BytesMut::new(),
+            chacha_tag_buf: BytesMut::new(),
+        }
+    }
+    fn car_screen() -> (
+        TeardownGuard<ScreenTransmitProxy>,
+        Arc<Mutex<VecDeque<ScreenTransmitOp>>>,
+        Arc<AtomicUsize>,
+    ) {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let proxy = ScreenTransmitProxy::new(
+            Duration::ZERO,
+            queue.clone(),
+            Arc::new(Mutex::new(false)),
+            catplay_util::notify::Notify::new(),
+            catplay_util::notify::Notify::new(),
+            8,
+        );
+        let drops = Arc::new(AtomicUsize::new(0));
+        let count = drops.clone();
+        (
+            TeardownGuard::new(proxy, move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            }),
+            queue,
+            drops,
+        )
+    }
+
+    #[tokio::test]
+    async fn mirror_forwards_config_idr_then_delta_to_real_transmitter_queue_with_two_frame_cap() {
+        let mut overlay = OverlayManager::new(800, 480, 30, 160.0, None);
+        overlay.enable_mirroring();
+        overlay.set_mirror_peer(Some(handle()));
+        let (screen, queue, _) = car_screen();
+        overlay.set_car_peer(screen);
+        let (mut sink, receiver) = MirrorBridge::new(MirrorLimits::new(800, 480, 66, 31, 1024).unwrap());
+        overlay.set_mirror_screen(receiver);
+        sink.set_avcc_config(config()).await.unwrap();
+        sink.process_frame(frame(true)).await.unwrap();
+        overlay.reconcile().await;
+        sink.process_frame(frame(false)).await.unwrap();
+        overlay.reconcile().await;
+        assert_eq!(
+            queue
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| op.is_frame())
+                .count(),
+            2
+        );
+        assert!(matches!(queue.lock().unwrap().front(), Some(ScreenTransmitOp::Configure(_))));
+        // The third frame remains in the bounded bridge rather than entering
+        // the legacy queue's larger default capacity.
+        sink.process_frame(frame(false)).await.unwrap();
+        overlay.reconcile().await;
+        assert!(overlay.mirror_screen.as_ref().unwrap().has_pending_frame());
+        assert_eq!(
+            queue
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| op.is_frame())
+                .count(),
+            2
+        );
+        assert!(overlay.renderer.is_none());
+    }
+
+    #[tokio::test]
+    async fn unsupported_reconfiguration_closes_bridge_and_retires_old_car_stream() {
+        let mut overlay = OverlayManager::new(800, 480, 30, 160.0, None);
+        overlay.enable_mirroring();
+        overlay.set_mirror_peer(Some(handle()));
+        let (screen, queue, drops) = car_screen();
+        overlay.set_car_peer(screen);
+        let (mut sink, receiver) = MirrorBridge::new(MirrorLimits::new(800, 480, 66, 31, 1024).unwrap());
+        overlay.set_mirror_screen(receiver);
+        sink.set_avcc_config(config()).await.unwrap();
+        sink.process_frame(frame(true)).await.unwrap();
+        overlay.reconcile().await;
+        queue.lock().unwrap().clear();
+        let mut next = config();
+        next.video_latency = Duration::from_millis(50);
+        sink.set_avcc_config(next.clone()).await.unwrap();
+        let mut idr = frame(true);
+        idr.config = Some(next);
+        sink.process_frame(idr).await.unwrap();
+        overlay.reconcile().await;
+        assert!(overlay.mirror_screen.as_ref().unwrap().is_closed());
+        assert!(queue.lock().unwrap().is_empty());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(!overlay.has_car_peer());
+    }
+
+    #[tokio::test]
+    async fn retiring_late_previous_screen_setup_preserves_successor_phone_and_idr() {
+        let mut overlay = OverlayManager::new(800, 480, 30, 160.0, None);
+        overlay.enable_mirroring();
+        overlay.set_mirror_peer(Some(handle()));
+        let (mut successor_sink, successor) = MirrorBridge::new(MirrorLimits::new(800, 480, 66, 31, 1024).unwrap());
+        overlay.set_mirror_screen(successor);
+        successor_sink.set_avcc_config(config()).await.unwrap();
+        successor_sink.process_frame(frame(true)).await.unwrap();
+        // An old owner's asynchronous SETUP can complete after the successor
+        // is admitted. Retiring that guard must not close the new bridge.
+        let (late_old_screen, _, old_drops) = car_screen();
+        overlay.set_car_peer(late_old_screen);
+        overlay.retire_mirror_car_stream();
+        assert_eq!(old_drops.load(Ordering::SeqCst), 1);
+        assert!(!overlay.mirror_screen.as_ref().unwrap().is_closed());
+        assert!(overlay.mirror_screen.as_ref().unwrap().has_pending_frame());
+        let (fresh_screen, queue, _) = car_screen();
+        overlay.set_car_peer(fresh_screen);
+        overlay.reconcile().await;
+        assert_eq!(
+            queue
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|op| op.is_frame())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_mirror_never_starts_normal_ui_or_blue_tooth_policy() {
+        let mut overlay = OverlayManager::new(800, 480, 30, 160.0, None);
+        overlay.enable_mirroring();
+        overlay.reconcile().await;
+        assert!(overlay.renderer.is_none());
+        assert!(overlay.overlay_current.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), overlay.sleep())
+                .await
+                .is_ok()
+        );
+        assert!(overlay.renderer.is_none());
+    }
 }

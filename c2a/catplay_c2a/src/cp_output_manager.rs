@@ -3,7 +3,7 @@ use std::{error::Error, path::PathBuf};
 use log::info;
 
 use crate::{AppConfig, HomeKitManager, MfiManager, ProdGadget, ProdGadgetConfig};
-use catplay_util::{EventReconciler, EventSleeper, Reconciler};
+use catplay_util::{AsyncShutdown, EventReconciler, EventSleeper, Reconciler};
 
 #[derive(EventSleeper, EventReconciler)]
 #[reconcile_error[()]]
@@ -23,6 +23,18 @@ impl CarPlayOutputManager {
     }
 
     pub fn start(&mut self, config: &AppConfig, _mfi: &MfiManager, homekit: &HomeKitManager) -> Result<(), Box<dyn Error>> {
+        self.start_with_options(config, _mfi, homekit, crate::RuntimeOptions::default())
+    }
+
+    pub fn start_with_options(
+        &mut self,
+        config: &AppConfig,
+        _mfi: &MfiManager,
+        homekit: &HomeKitManager,
+        options: crate::RuntimeOptions,
+    ) -> Result<(), Box<dyn Error>> {
+        #[cfg(not(feature = "experimental_airplay_mirroring"))]
+        let _ = options;
         let gadget = &config.gadget;
         if !gadget.enabled {
             info!("Gadget manager is disabled");
@@ -43,6 +55,8 @@ impl CarPlayOutputManager {
             })?
             .join("catplay_last_connect.txt");
         let cfg = ProdGadgetConfig {
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            mirroring: options.mirroring,
             homekit_rx: homekit.homekit_rx.clone().unwrap(),
             homekit_tx: homekit.homekit_tx.clone().unwrap(),
             mfi: Some(_mfi.get_device()),
@@ -64,5 +78,14 @@ impl CarPlayOutputManager {
         self.gadget_manager = Some(g);
         self.enabled = true;
         Ok(())
+    }
+}
+
+impl catplay_util::AsyncShutdown for CarPlayOutputManager {
+    async fn shutdown(&mut self) {
+        if let Some(mut gadget) = self.gadget_manager.take() {
+            gadget.shutdown().await;
+        }
+        self.enabled = false;
     }
 }

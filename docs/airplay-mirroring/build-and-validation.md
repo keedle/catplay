@@ -1,6 +1,6 @@
 # AirPlay mirroring build and validation
 
-This guide records a reproducible validation path for the AirPlay mirroring experiments. Production CatPlay remains CarPlay-only: the receiver gadgets still construct `AirPlayReceiverProfile::CarPlay`, and the feature-gated picture-only receiver is exposed only by the diagnostic example, not the shipping service. Treat the standalone experiment and replay harness as research tools until the protocol and session blockers are resolved.
+This guide records a reproducible validation path for the AirPlay mirroring experiments. Default CatPlay startup remains CarPlay. A feature-enabled build now has an explicit experimental process mode connecting the picture-only receiver to the car-facing transmitter; see [integrated mode](integrated-mode.md). Full application CI and physical validation of this continuation remain pending. Treat the standalone experiment and replay harness as research tools until the protocol and session blockers are resolved.
 
 ## Source pins and evidence levels
 
@@ -52,6 +52,24 @@ cargo run --manifest-path experiments/airplay-mirroring/Cargo.toml --locked -- -
 
 The replay harness passes 20 imported production-source tests, including three new random-access detection tests, five framing tests and three combined policy/converter tests. These tests cover video framing/conversion paths; they do not exercise crypto, RTSP negotiation, or a decoder. The standalone policy passes 15 unit tests. Both synthetic replay executables pass. The full protocol suite cannot run on this Mac; its Linux continuation results are recorded below. Label the replay inputs accurately: deterministic generated fixtures are **generated fixture replay**; bytes from an actual device session are **captured trace replay**. Neither label means a full live session succeeded.
 
+## Integrated application checks
+
+The Linux workflow also defines an application matrix for normal features and
+`experimental_airplay_mirroring`. Each job builds the actual `catplay_c2a` binary
+and runs its library tests without starting the application or accessing USB,
+Bluetooth, a phone or an adapter. This covers application integration that the
+protocol-only jobs do not compile.
+
+The jobs use Ubuntu 22.04 and Rust 1.99.1. The application requires the TurboJPEG
+3 API, so CI builds libjpeg-turbo 3.0.1 in a temporary local prefix and verifies
+its source archive SHA-256 before use. This host dependency does not alter the
+firmware's pinned compiler or target libraries.
+
+The workflow definition is not a passing result. Record the completed run and
+revision before treating an integrated application change as Linux-validated.
+A Linux build remains distinct from a compatible MIPS build and from observing
+an actual picture on the Peugeot screen.
+
 ## Linux/MIPS cross-build and firmware build
 
 The supported product build path is the Yocto recipe, not an ad-hoc Rust target invocation. `meta-catplay/recipes-apps/catplay_git.bb` applies MIPS-specific relocation, BFD linker and `libatomic` flags, and depends on target libraries including multimedia, graphics, D-Bus, USB and OpenSSL. The generic musl Docker test image itself warns that its `Instant::now()` does not work on the physical target. Use the firmware layer's matching MIPS sysroot and compiler for any production app artifact.
@@ -88,12 +106,12 @@ For each trace, state its origin and stage so data from independent sessions can
 5. **Result:** parser/harness version, command, expected behavior, actual output, and limitations. Label generated fixtures as generated; label physical captures as captured even when redacted or re-encoded.
 6. **Cross-check:** only after a complete documented replay, compare a physical session stage by stage. Capture service advertisement, negotiated profile, session lifecycle, screen bytes, audio bytes, and teardown separately; a valid decode alone does not prove the phone received usable mirroring.
 
-## Later permission-gated manual validation
+## Later supervised manual validation
 
-These stages involve a changed test build and require a separate explicit go-ahead. The user has authorized read-only SSH inspection, which has now succeeded. That does not authorize installation, reboot, settings changes or flashing.
+The user has requested a temporary supervised adapter test. Prepare the compatible artifact and readiness checks before arranging their participation. That request does not authorize unattended execution, installation, reboot, settings changes or flashing.
 
 1. Review the complete diff, host test outcomes, cross-build artifact sizes, partition fit, and rollback/recovery procedure. Stop if any of these are missing.
-2. Get permission for a **temporary, reversible manual test** and agree on the exact adapter, phone, connection sequence, allowed observations, and stop/rollback point.
+2. Confirm the user is present for the already-requested **temporary, reversible manual test**, with the exact adapter, phone, connection sequence, allowed observations and cleanup plan ready.
 3. Use a temporary build from the pinned sources with CarPlay as the boot default and a user-invoked test switch. Do not overwrite persistent configuration. First verify startup, USB CarPlay operation, and return to the original behavior.
 4. Enable the experimental profile only for one supervised session. Capture each protocol stage and resource observation separately. Stop on boot instability, session conflict, loss of CarPlay, or resource exhaustion; restore the known-good configuration/build immediately.
 5. Report the result as a manual physical test with firmware hash and exact test conditions. It does not authorize flashing, publishing, or enabling the experimental mode by default.
@@ -108,4 +126,4 @@ The [successful hosted Linux run](https://github.com/keedle/catplay/actions/runs
 
 The application code is identical in later revision `886bb2ad9b930c14e9a31e54c3671033e7934001`. The intervening changes affect only the runner image and documentation. Earlier notes incorrectly treated a redundant queued retry as the only current evidence; the archived successful run is authoritative for this application code. These results do not validate MIPS execution, live Apple pairing, a decoder or car playback.
 
-The user selected hosted builds and has no SDK or separate Linux builder. The [MIPS probe build plan](mips-probe-build-plan.md) records target ABI evidence and the requirements for a firmware-matched build. No MIPS artifact has been built. Vehicle-facing integration remains unwired. Read-only adapter inspection succeeded; no installation, configuration change or flash action occurred.
+The user selected hosted builds and has no SDK or separate Linux builder. The [MIPS probe build plan](mips-probe-build-plan.md) records target ABI evidence and the requirements for a firmware-matched build. No MIPS artifact has been built. Vehicle-facing integration is now present in the reviewed source, with full application Linux validation pending. Read-only adapter inspection succeeded; no installation, configuration change or flash action occurred.

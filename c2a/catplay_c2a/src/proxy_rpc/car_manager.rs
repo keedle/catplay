@@ -29,6 +29,12 @@ use crate::{
 };
 
 pub struct CarManager {
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    mirror_mode: bool,
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    mirror_peer: Option<(super::MirrorSessionId, AirPlayReceiverHandleRef)>,
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    mirror_reset_pending: bool,
     // TODO dont wrap the ref with TeardownGuard...
     car_state: TeardownGuard<AirPlayTransmitterProxyRef>,
     car_had_record: bool,
@@ -93,6 +99,12 @@ impl CarManager {
         let overlay = OverlayManager::new(width, height, fps, dpi, persist_dir);
 
         Ok(Self {
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            mirror_mode: false,
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            mirror_peer: None,
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            mirror_reset_pending: false,
             car_media_clock,
             car_had_record: false,
             iphone_peer: None,
@@ -110,6 +122,14 @@ impl CarManager {
             proxy_rx,
             tx_current: None,
         })
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn enable_mirroring(mut self) -> Self {
+        self.mirror_mode = true;
+        self.overlay.enable_mirroring();
+        self.modes.release_mirror_screen();
+        self
     }
 
     pub fn tx_idle(&self) -> bool {
@@ -248,10 +268,24 @@ impl CarManager {
             self.dispatch_car_command(cmd).await;
         }
 
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        if self.mirror_reset_pending {
+            self.overlay.retire_mirror_car_stream();
+            if self.pending_screen_setup.is_none() {
+                let tx = self.car_state.clone();
+                self.tx_queue
+                    .push_back(async move { tx.drain_teardown_queue().await }.boxed());
+                self.mirror_reset_pending = false;
+            }
+        }
         self.flush_modes();
 
         // Don't attempt to forcefully steal Screen if we have a peer and arbitration is active as that will be glitchy
-        if self.iphone_peer.is_none() && !self.initial_screen_steal_attempted {
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        let allow_idle_overlay = !self.mirror_mode;
+        #[cfg(not(feature = "experimental_airplay_mirroring"))]
+        let allow_idle_overlay = true;
+        if allow_idle_overlay && self.iphone_peer.is_none() && !self.initial_screen_steal_attempted {
             self.initial_screen_steal_attempted = true;
             self.modes
                 .try_steal_screen(ResourceTransferPriority::NiceToHave);
@@ -279,7 +313,11 @@ impl CarManager {
                 .push_back(async move { tx.assert_modes(modes).await }.boxed());
         }
 
-        if self.modes.has_screen() && !self.overlay.has_car_peer() && self.pending_screen_setup.is_none() {
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        let source_ready = !self.mirror_mode || self.mirror_peer.is_some();
+        #[cfg(not(feature = "experimental_airplay_mirroring"))]
+        let source_ready = true;
+        if source_ready && self.modes.has_screen() && !self.overlay.has_car_peer() && self.pending_screen_setup.is_none() {
             info!("Scheduling screen SETUP");
             // Ensure screen is SETUP
             let tx = self.car_state.clone();
@@ -288,10 +326,16 @@ impl CarManager {
             self.pending_screen_setup.replace(orx);
             let modes = self.modes.modes_mut().serialize_to_state();
 
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            let mirroring = self.mirror_mode;
             self.tx_queue.push_back(
                 async move {
                     tx.assert_modes(modes).await?;
 
+                    #[cfg(feature = "experimental_airplay_mirroring")]
+                    if mirroring {
+                        tx.drain_teardown_queue().await?;
+                    }
                     warn!("Screen SETUP start");
                     let screen = tx.setup_screen(Duration::from_millis(25)).await?;
                     warn!("Screen SETUP end");
@@ -327,6 +371,43 @@ impl CarManager {
 
     pub fn dispatch_tx_op(&mut self, op: TxAdapterOp) {
         match op {
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            TxAdapterOp::MirrorConnected { id, handle } => {
+                if !self.mirror_mode || self.iphone_peer.is_some() || self.mirror_peer.is_some() {
+                    handle.close(RtspError::NotSupported);
+                    return;
+                }
+                self.mirror_peer = Some((id, handle.clone()));
+                self.overlay.set_mirror_peer(Some(handle));
+                self.mirror_reset_pending = true;
+                self.modes
+                    .try_steal_screen(ResourceTransferPriority::UserInitiated);
+            }
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            TxAdapterOp::MirrorScreen { id, mut receiver } => {
+                if self
+                    .mirror_peer
+                    .as_ref()
+                    .is_some_and(|(active, _)| active.matches(&id))
+                {
+                    self.overlay.set_mirror_screen(receiver);
+                } else {
+                    receiver.close();
+                }
+            }
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            TxAdapterOp::MirrorDisconnected { id } => {
+                if self
+                    .mirror_peer
+                    .as_ref()
+                    .is_some_and(|(active, _)| active.matches(&id))
+                {
+                    self.mirror_peer = None;
+                    self.overlay.set_mirror_peer(None);
+                    self.mirror_reset_pending = true;
+                    self.modes.release_mirror_screen();
+                }
+            }
             TxAdapterOp::IphoneConnected { handle } => {
                 self.on_peer_connected(handle);
             }
@@ -499,6 +580,35 @@ impl CarManager {
     }
 
     async fn dispatch_car_command(&mut self, cmd: CommandPending) {
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        if self.mirror_mode {
+            // Picture-only phones have no CarPlay control session. Resource
+            // arbitration remains local to the car-facing connection.
+            let mut cmd = cmd;
+            match cmd.command() {
+                Command::ForceKeyFrame(_) => {
+                    // Mirroring has no evidenced keyframe request transport.
+                    self.overlay.fail_mirror_stream();
+                    cmd.respond_err();
+                }
+                Command::ChangeModes(change) => {
+                    let response = if self.mirror_peer.is_some() {
+                        self.modes.process_car_request(change)
+                    } else {
+                        ChangeModesResponse::error(2)
+                    };
+                    if cmd.respond_plist(HttpStatus::Ok, response).is_err() {
+                        cmd.respond_err();
+                    }
+                }
+                Command::SetNightMode(value) => {
+                    self.night_mode = value.night_mode;
+                    cmd.respond_ok();
+                }
+                _ => cmd.respond_err(),
+            }
+            return;
+        }
         // Received over USB; this function can run in background outside of RTSP TX thread
         // [starts synchronously, but the async task will run in background]
         // This is also latency-sensitive (like hid events) so it makes sense to have a few inflight commands at a time
@@ -636,6 +746,11 @@ impl CarManager {
 
 impl Drop for CarManager {
     fn drop(&mut self) {
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        if let Some((_, handle)) = self.mirror_peer.take() {
+            self.overlay.set_mirror_peer(None);
+            handle.close(RtspError::Closed);
+        }
         // TODO ensure closed in all cases
         if let Some(phone) = self.iphone_peer.take() {
             phone

@@ -2,7 +2,7 @@ use std::{error::Error, fs};
 
 use crate::{AppConfig, CarPlayOutputManager, HomeKitManager, MfiManager};
 // use catplay_iap2_usb_gadget::gadget::GadgetHelper;
-use catplay_util::{EventReconciler, EventSleeper};
+use catplay_util::{AsyncShutdown, EventReconciler, EventSleeper};
 use tokio::signal;
 
 fn parse_config(path: String) -> Result<AppConfig, String> {
@@ -34,6 +34,10 @@ async fn wait_forever() -> Result<(), Box<dyn Error>> {
 
 impl Main {
     pub async fn start() -> Result<Main, Box<dyn Error>> {
+        Self::start_with_options(crate::RuntimeOptions::default()).await
+    }
+
+    pub async fn start_with_options(options: crate::RuntimeOptions) -> Result<Main, Box<dyn Error>> {
         let config = parse_config("./c2a.toml".into()).or(parse_config("/etc/catplay/catplay.conf".into()))?;
 
         // if let Err(_err) = GadgetHelper::cleanup_once() {
@@ -49,7 +53,7 @@ impl Main {
         homekit.start(&config, &mfi)?;
 
         let mut output = CarPlayOutputManager::new();
-        output.start(&config, &mfi, &homekit)?;
+        output.start_with_options(&config, &mfi, &homekit, options)?;
 
         Ok(Main {
             mfi: Some(mfi),
@@ -57,6 +61,12 @@ impl Main {
             // input: Some(input),
             output: Some(output),
         })
+    }
+
+    pub async fn shutdown(&mut self) {
+        if let Some(output) = self.output.as_mut() {
+            output.shutdown().await;
+        }
     }
 
     pub async fn do_loop(&mut self) -> Result<(), Box<dyn Error>> {

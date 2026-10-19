@@ -115,6 +115,15 @@ impl ModesArbiter {
         }*/
     }
 
+    /// Picture-only mode has no UI or phone session while idle. Return the
+    /// screen to the car without changing radio/audio ownership or constraints.
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn release_mirror_screen(&mut self) {
+        let old = self.modes.screen;
+        self.modes.screen = ResourceManager::accessory_owned(old.take_constraint(), old.borrow_constraint());
+        self.modes_dirty = true;
+    }
+
     pub fn has_screen(&self) -> bool {
         self.modes.screen.entity() == EntityEnum::Controller
     }
@@ -390,5 +399,23 @@ mod tests {
         assert_eq!(arbiter.modes.main_audio.state(), ResourceState::AccessoryHas);
         assert_eq!(arbiter.modes.main_audio.take_constraint(), ResourceConstraint::Never);
         assert_eq!(arbiter.modes.main_audio.borrow_constraint(), ResourceConstraint::UserInitiated);
+    }
+}
+
+#[cfg(all(test, feature = "experimental_airplay_mirroring"))]
+mod mirror_mode_tests {
+    use super::*;
+    #[test]
+    fn idle_and_disconnected_mirror_release_screen_without_taking_audio() {
+        let mut arbiter = ModesArbiter::new(&ChangeModes::initial());
+        let audio = arbiter.modes.main_audio;
+        arbiter.release_mirror_screen();
+        assert!(!arbiter.has_screen());
+        assert_eq!(arbiter.modes.main_audio, audio);
+        arbiter.try_steal_screen(ResourceTransferPriority::UserInitiated);
+        assert!(arbiter.has_screen());
+        arbiter.release_mirror_screen();
+        assert!(!arbiter.has_screen());
+        assert_eq!(arbiter.modes.main_audio, audio);
     }
 }

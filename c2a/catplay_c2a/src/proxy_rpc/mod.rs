@@ -14,3 +14,12 @@ pub use overlay_manager::*;
 pub use proxy_screen::*;
 pub use rx_bridge::*;
 pub use tx_adapter::*;
+
+#[cfg(feature = "experimental_airplay_mirroring")]
+mod mirror_bridge;
+#[cfg(feature = "experimental_airplay_mirroring")]
+pub use mirror_bridge::*;
+#[cfg(feature = "experimental_airplay_mirroring")]
+mod mirror_rx;
+#[cfg(feature = "experimental_airplay_mirroring")]
+pub use mirror_rx::*;

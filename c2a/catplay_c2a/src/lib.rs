@@ -1,6 +1,8 @@
 #![recursion_limit = "256"]
 
 mod config;
+mod runtime_options;
+pub use runtime_options::*;
 mod cp_output_manager;
 mod homekit_manager;
 mod main_init;

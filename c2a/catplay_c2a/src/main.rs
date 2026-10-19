@@ -2,7 +2,7 @@
 
 use std::process::exit;
 
-use catplay_c2a::Main;
+use catplay_c2a::{Main, RuntimeOptions};
 use catplay_tracing::logger::{AsyncLogger, setup_prod_logger};
 use catplay_tracing::tracer::SessionTracer;
 use log::{error, info, warn};
@@ -43,26 +43,58 @@ async fn main() {
     #[cfg(all(feature = "jemalloc", not(target_arch = "riscv32")))]
     disable_jemalloc_thread_cache();
 
-    println!("Booting!!");
-    setup_prod_logger();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["--help"] {
+        println!("catplay_c2a [--experimental-airplay-mirroring --mirror-h264-profile-idc N --mirror-h264-level-idc N]");
+        println!(
+            "Mirroring requires its compile feature, a connected car, and an already configured network interface. H264 values are admission gates, not measured decoder support. Audio and phone controls are unavailable."
+        );
+        return;
+    }
+    let options = match RuntimeOptions::parse(&args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("{message}");
+            exit(2);
+        }
+    };
+    let mirroring = options.is_mirroring();
+    if mirroring {
+        // Receiver debug logs and session tracing can contain peer keys/payload.
+        // This experimental process intentionally installs no production logger.
+        SessionTracer::disable_globally();
+        println!("Experimental picture-only mirroring selected; CarPlay phone invitations disabled.");
+    } else {
+        setup_prod_logger();
+    }
     AsyncLogger::set_async(true);
     let b = AsyncLogger::create_barrier();
-    if std::env::var("CATPLAY_TRACING").as_deref() == Ok("1") {
+    if !mirroring && std::env::var("CATPLAY_TRACING").as_deref() == Ok("1") {
         warn!("Tracing is enabled (overhead)");
         SessionTracer::enable_globally();
     }
 
     info!("Calling start()");
 
-    let mut main = Main::start().await;
+    let mut main = Main::start_with_options(options).await;
     match main {
         Err(err) => {
             error!("Failed to start: {}", err);
+            if mirroring {
+                eprintln!("Experimental mirroring startup failed");
+            }
         }
         Ok(ref mut main) => {
             info!("Started");
 
-            if let Err(err) = main.do_loop().await {
+            if mirroring {
+                tokio::select! {
+                    result = main.do_loop() => { if result.is_err() { eprintln!("Experimental mirroring stopped"); } },
+                    _ = tokio::signal::ctrl_c() => {},
+                }
+                // Bound cleanup even if a peer stops responding during teardown.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), main.shutdown()).await;
+            } else if let Err(err) = main.do_loop().await {
                 error!("Error during reconcile: {}", err);
             }
         }

@@ -20,6 +20,20 @@ pub struct TxAdapter {
 }
 
 pub enum TxAdapterOp {
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    MirrorConnected {
+        id: super::MirrorSessionId,
+        handle: AirPlayReceiverHandleRef,
+    },
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    MirrorScreen {
+        id: super::MirrorSessionId,
+        receiver: super::MirrorBridgeReceiver,
+    },
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    MirrorDisconnected {
+        id: super::MirrorSessionId,
+    },
     IphoneConnected {
         handle: AirPlayReceiverHandleRef,
     },
