@@ -12,7 +12,7 @@ jobs:
   protocol:
     # This development workflow is scoped to the user's fork.
     if: github.repository == 'keedle/catplay'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
