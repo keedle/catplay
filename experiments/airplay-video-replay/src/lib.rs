@@ -16,8 +16,11 @@ mod avcc;
 mod avcc_extended;
 #[path = "../../../carplay/catplay_carplay/src/video/hvcc.rs"]
 mod hvcc;
+#[path = "../../../carplay/catplay_carplay/src/video/random_access.rs"]
+mod random_access;
 
 pub mod video {
+    pub use crate::random_access::*;
     pub use crate::nal::*;
     pub use crate::annexb_iter::*;
     pub use crate::annexb_builder::*;

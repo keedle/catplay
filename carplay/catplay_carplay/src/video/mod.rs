@@ -7,6 +7,7 @@ mod hvcc;
 mod nal;
 mod pipeline;
 mod pts;
+mod random_access;
 mod video_frame;
 
 pub use annexb_builder::*;
@@ -18,4 +19,5 @@ pub use hvcc::*;
 pub use nal::*;
 pub use pipeline::*;
 pub use pts::*;
+pub use random_access::*;
 pub use video_frame::*;

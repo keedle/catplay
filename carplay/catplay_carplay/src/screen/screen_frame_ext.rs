@@ -8,7 +8,7 @@ use crate::{
     clock::{MediaClock, NtpU64},
     screen::{ScreenFlag, ScreenFrame, ScreenOpCode, Value64},
     video::{
-        AnnexBConverter, AvccConfig, AvccConfigExtended, EncodedVideoFrame, HevcNalType, NalChunk, NalError, NalType,
+        AnnexBConverter, AvccConfig, AvccConfigExtended, EncodedVideoFrame, NalChunk, NalError, access_unit_is_keyframe,
         avcc_config_deserialize, avcc_config_serialize, hvcc_config_deserialize, hvcc_config_serialize,
         hvcc_sample_entry_extract_codec_config, hvcc_write_stsd_atom_from_old_format_with_tags,
     },
@@ -101,28 +101,9 @@ impl ScreenFrame {
             pts_decoded.replace(now);
         }
 
-        let nal_byte = self.data.get(nal_size_len).copied().unwrap_or(0);
-        let is_keyframe = match config.hevc {
-            true => {
-                let is_keyframe = HevcNalType::from_byte(nal_byte).is_irap();
-                let nal_type = NalType::from_byte(nal_byte);
-                debug!("nal_type: {nal_type:?} is_keyframe={is_keyframe}");
-                is_keyframe
-            }
-            false => {
-                let nal_byte = self
-                    .data
-                    .get(config.avcc.nal_size_len)
-                    .copied()
-                    .unwrap_or(0);
-                let nal_type = NalType::from_byte(nal_byte);
-                let is_keyframe = nal_type.is_keyframe();
-                debug!("nal_type: {nal_type:?} is_keyframe={is_keyframe}");
-                is_keyframe
-            }
-        };
-
         self.scan(nal_size_len, true)?;
+        let is_keyframe = access_unit_is_keyframe(&self.data, &self.nal_offset_cache, config.hevc)?;
+
         self.convert_startcodes(nal_size_len, true)?;
 
         debug!(
@@ -259,5 +240,33 @@ plist_struct! {
         pub sent_frames_avg: u32,
         pub queued_frames_avg: u32,
         pub loss_avg: f64,
+    }
+}
+
+#[cfg(test)]
+mod keyframe_tests {
+    use super::*;
+    use crate::clock::MediaClockSession;
+
+    #[test]
+    fn decoding_metadata_before_idr_preserves_frame_and_marks_keyframe() {
+        let clock = MediaClockSession::new();
+        let config = AvccConfigExtended {
+            hevc: false,
+            avcc: AvccConfig {
+                nal_size_len: 4,
+                sps_pps: vec![],
+            },
+            video_latency: Duration::ZERO,
+            width: 800,
+            height: 480,
+            respect_timestamps: false,
+        };
+        let annexb = BytesMut::from(&[0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x06, 0x80, 0, 0, 0, 1, 0x65, 0x88, 0x84][..]);
+        let wire = ScreenFrame::video_annexb(annexb.clone(), 4, Instant::now(), &clock).unwrap();
+        let decoded = wire.video_decode(&config, &clock).unwrap().unwrap();
+        assert_eq!(decoded.is_keyframe, Some(true));
+        assert_eq!(decoded.data, annexb);
+        assert_eq!(decoded.nal_offsets.unwrap().len(), 3);
     }
 }

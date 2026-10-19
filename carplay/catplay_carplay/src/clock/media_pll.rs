@@ -191,18 +191,19 @@ mod tests {
     }
 
     #[test]
-    fn test_drift_effect() {
-        let mut pll = MediaPll::new(0, 0);
-        pll.freq_offset_ns_per_s = 1_000; // 1 µs per second drift
-
-        let t1 = 0i128;
-        let t2 = 1_000_000_000i128; // 1 s later
-
-        let remote1 = pll.local_to_remote(t1);
-        let remote2 = pll.local_to_remote(t2);
-
-        let drift = remote2 - remote1 - (t2 - t1);
-        assert_eq!(drift, 1_000, "drift mismatch: got {} ns", drift);
+    fn offset_only_policy_ignores_phase_and_frequency() {
+        // The production policy deliberately disables PLL corrections. Keep this
+        // expectation explicit instead of testing a dormant drift formula.
+        assert!(MediaPll::DISABLE_PLL);
+        for offset in [-123_000, 123_000] {
+            let mut pll = MediaPll::new(0, offset);
+            pll.phase_adjust_ns = 500;
+            pll.freq_offset_ns_per_s = 1_000;
+            for local in [0, 1_000_000_000, 40_000_000_000] {
+                assert_eq!(pll.local_to_remote(local), local + offset);
+                assert_eq!(pll.remote_to_local(local + offset), local);
+            }
+        }
     }
     #[test]
     fn test_round_trip_after_time_passes() {
