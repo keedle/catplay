@@ -11,7 +11,7 @@ use futures::{FutureExt, future::BoxFuture};
 use log::{debug, error};
 
 use crate::{
-    carplay_rx::AirPlayReceiverHandle,
+    carplay_rx::{AirPlayReceiverHandle, AirPlayReceiverProfile},
     clock::{MediaClock, MediaClockBox, MediaClockProxy},
     events::CommandsClient,
     modes::{AirPlayModeState, AppState, ChangeModes, ChangeModesResponse, Resource},
@@ -26,6 +26,7 @@ pub struct AirPlayReceiverHandleImpl {
     task_queue: mpsc::UnboundedSender<BoxFuture<'static, ()>>,
     iface: String,
     wireless: bool,
+    profile: AirPlayReceiverProfile,
     close_pending_tx: mpsc::Sender<RtspError>,
 
     serializer: Arc<Mutex<CachingSerializer>>,
@@ -42,12 +43,33 @@ impl AirPlayReceiverHandleImpl {
         wireless: bool,
         close_pending_tx: mpsc::Sender<RtspError>,
     ) -> Self {
+        Self::new_with_profile(
+            events_rtsp,
+            media_clock,
+            task_queue,
+            iface,
+            wireless,
+            close_pending_tx,
+            AirPlayReceiverProfile::CarPlay,
+        )
+    }
+
+    pub fn new_with_profile(
+        events_rtsp: Option<RtspQueue>,
+        media_clock: MediaClockProxy,
+        task_queue: mpsc::UnboundedSender<BoxFuture<'static, ()>>,
+        iface: &str,
+        wireless: bool,
+        close_pending_tx: mpsc::Sender<RtspError>,
+        profile: AirPlayReceiverProfile,
+    ) -> Self {
         Self {
             events_rtsp,
             media_clock,
             task_queue,
             iface: iface.into(),
             wireless,
+            profile,
             close_pending_tx,
             serializer: Default::default(),
         }
@@ -181,10 +203,10 @@ impl AirPlayReceiverHandle for AirPlayReceiverHandleImpl {
     }
 
     fn is_car(&self) -> bool {
-        true
+        self.profile.is_car()
     }
 
     fn is_mirroring(&self) -> bool {
-        false
+        self.profile.is_mirroring()
     }
 }

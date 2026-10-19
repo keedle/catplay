@@ -150,10 +150,16 @@ impl TxAdapter {
         self.handle.replace(handle);
     }
 
-    pub async fn on_shutdown(&mut self) {}
+    pub async fn on_shutdown(&mut self) {
+        self.on_drop();
+    }
 
     pub fn on_drop(&mut self) {
-        let _ = self.car.unbounded_send(TxAdapterOp::IphoneDisconnected {});
+        // Uninitialized/rejected sinks never owned the phone connection. A sink
+        // already shut down must not disconnect a later accepted connection.
+        if self.handle.take().is_some() {
+            let _ = self.car.unbounded_send(TxAdapterOp::IphoneDisconnected {});
+        }
     }
 
     pub async fn on_modes(&mut self, modes: AirPlayModeState) {
@@ -162,5 +168,53 @@ impl TxAdapter {
             .car
             .unbounded_send(TxAdapterOp::Modes { modes, consumed: os.0 });
         let _ = os.1.await;
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use catplay_carplay::{carplay_rx::sink::AirPlayReceiverHandleImpl, clock::TimingClient};
+
+    fn handle() -> AirPlayReceiverHandleRef {
+        let (close_tx, _close_rx) = mpsc::channel(1);
+        Arc::new(AirPlayReceiverHandleImpl::new(
+            None,
+            TimingClient::new().1,
+            mpsc::unbounded().0,
+            "lo",
+            true,
+            close_tx,
+        ))
+    }
+
+    use std::sync::Arc;
+
+    #[test]
+    fn dropping_uninitialized_or_rejected_adapter_never_disconnects_owner() {
+        let (tx, mut rx) = mpsc::unbounded();
+        let mut adapter = TxAdapter::new(tx);
+        adapter.on_drop();
+        assert!(rx.try_next().is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_disconnects_once_and_late_drop_does_not_disconnect_new_owner() {
+        let (tx, mut rx) = mpsc::unbounded();
+        let mut old = TxAdapter::new(tx.clone());
+        old.on_init(handle());
+        assert!(matches!(rx.try_next(), Ok(Some(TxAdapterOp::IphoneConnected { .. }))));
+        old.on_shutdown().await;
+        assert!(matches!(rx.try_next(), Ok(Some(TxAdapterOp::IphoneDisconnected))));
+        let mut next = TxAdapter::new(tx);
+        next.on_init(handle());
+        assert!(matches!(rx.try_next(), Ok(Some(TxAdapterOp::IphoneConnected { .. }))));
+        old.on_drop();
+        old.on_shutdown().await;
+        assert!(rx.try_next().is_err());
+        next.on_drop();
+        assert!(matches!(rx.try_next(), Ok(Some(TxAdapterOp::IphoneDisconnected))));
+        next.on_drop();
+        assert!(rx.try_next().is_err());
     }
 }

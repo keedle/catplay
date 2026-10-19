@@ -54,6 +54,58 @@ pub enum SessionConflictPolicy {
 pub enum AirPlayReceiverProfile {
     CarPlay,
     AppleTV,
+    /// Opt-in picture-only mirroring experiment. No production listener selects it.
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    AppleTVH264VideoOnly,
+}
+
+impl AirPlayReceiverProfile {
+    pub fn is_car(self) -> bool {
+        self == Self::CarPlay
+    }
+
+    pub fn is_mirroring(self) -> bool {
+        !self.is_car()
+    }
+
+    pub(crate) fn is_picture_only(self) -> bool {
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        if self == Self::AppleTVH264VideoOnly {
+            return true;
+        }
+        false
+    }
+}
+
+/// Safe shape of a picture-only initial SETUP. It intentionally excludes all
+/// sender identity, key material, session IDs and request payload bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirPlayObservedTimingProtocol {
+    Absent,
+    Ntp,
+    Ptp,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct AirPlayInitialSetupObservation {
+    pub timing_protocol: AirPlayObservedTimingProtocol,
+    pub stream_count: usize,
+    /// At most the first eight stream types, for bounded diagnostic output.
+    pub stream_types: Vec<StreamType>,
+    pub encryption_type_bits: Option<u8>,
+    pub is_screen_mirroring_session: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirPlayReceiverDiagnostic {
+    UnsupportedInitialStreams,
+    UnsupportedTimingProtocol,
+    UnsupportedStreamSetup,
+    AudioUnsupported,
+    MissingMediaEncryption,
+    InitialSetupFailed,
+    ScreenTerminated,
 }
 
 /// Informations needed to bootstrap AirPlay receiver session.
@@ -174,11 +226,19 @@ pub type AirPlayReceiverHandleRef = Arc<dyn AirPlayReceiverHandle>;
 pub trait AirPlayReceiverSink: AsyncShutdownDyn + EventReconcilerDyn<Error = RtspError> + EventSleeperDyn + Send + 'static {
     /// Called in "initial setup" phase.
     ///
-    /// This is guaranteed to be the first callback to be received by the user, which can be used
-    /// to prepare data for next setup-related callbacks.
+    /// Runs after the shared session lock is acquired. `on_info` may run earlier.
+    /// If this callback fails after allocating resources, `shutdown` still runs
+    /// before the lock is released. A rejected competing connection never calls it.
     fn init(&mut self, session: AirPlayReceiverHandleRef) -> RtspResult<()> {
         Ok(())
     }
+
+    /// Optional metadata-only observation before picture-only SETUP validation.
+    /// No session ownership or initialization has happened at this point.
+    fn on_initial_setup_observation(&mut self, observation: AirPlayInitialSetupObservation) {}
+
+    /// An allowlisted diagnostic, without errors or request bytes that can carry secrets.
+    fn on_receiver_diagnostic(&mut self, diagnostic: AirPlayReceiverDiagnostic) {}
 
     /// Allows rejecting incoming sessions if Error is returned here.
     async fn on_initial_setup(&mut self) -> RtspResult<()> {

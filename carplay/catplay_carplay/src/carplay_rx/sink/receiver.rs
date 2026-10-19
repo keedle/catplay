@@ -21,7 +21,8 @@ use std::{sync::Arc, time::Duration};
 use crate::{
     audio::codec::{AudioDecoder, AudioEncoder},
     carplay_rx::{
-        AirPlayReceiverHandleRef, AirPlayReceiverProfile, AirPlayReceiverSessionError, AirPlayReceiverSinkBox,
+        AirPlayInitialSetupObservation, AirPlayObservedTimingProtocol, AirPlayReceiverDiagnostic, AirPlayReceiverHandleRef,
+        AirPlayReceiverProfile, AirPlayReceiverSessionError, AirPlayReceiverSinkBox,
         sink::{AirPlayReceiverHandleImpl, AirPlayServerShared, AirPlaySessionGuard},
     },
     cipher::AirPlayStreamEncryption,
@@ -60,11 +61,12 @@ impl AirPlayReceiverState {
     }
 }
 
-#[derive(AsyncShutdown, EventSleeper, EventReconciler)]
+#[derive(EventSleeper, EventReconciler)]
 #[reconcile_error(RtspError)]
 #[reconcile_func(reconcile_close_status, |e: AirPlayReceiverSessionError| RtspError::foreign(e))]
 #[reconcile_func(flush_iap2)]
 #[reconcile_func(reconcile_event_loop)]
+#[reconcile_func(reconcile_mirroring_screen_status)]
 pub struct AirPlayReceiver {
     pub bind_ip: SocketAddr,
     pub peer_ip: SocketAddr,
@@ -78,7 +80,6 @@ pub struct AirPlayReceiver {
     task_queue_rx: mpsc::UnboundedReceiver<BoxFuture<'static, ()>>,
 
     #[sleep]
-    #[shutdown]
     sink: AirPlayReceiverSinkBox,
     sink_had_init: bool,
 
@@ -92,7 +93,6 @@ pub struct AirPlayReceiver {
     stream_encryption: AirPlayStreamEncryption,
     #[sleep]
     #[reconcile(|e: AirPlayReceiverSessionError| RtspError::foreign(e))]
-    #[shutdown]
     streams: Streams,
 
     #[sleep]
@@ -113,12 +113,15 @@ pub struct AirPlayReceiver {
 struct Streams {
     #[sleep]
     #[reconcile(AirPlayReceiverSessionError::KeepAlive)]
+    #[shutdown(take)]
     keep_alive_socket: Option<UdpHelper<1500, 0, KeepAliveServer>>,
     #[sleep]
     #[reconcile(AirPlayReceiverSessionError::Events)]
+    #[shutdown(take)]
     event_socket: Option<TcpHelper<EventsClient>>,
     #[sleep]
     #[reconcile(AirPlayReceiverSessionError::Timing)]
+    #[shutdown(take)]
     timing_socket: Option<UdpHelper<1500, 0, TimingClient>>,
     media_clock: Option<MediaClockProxy>,
 
@@ -184,6 +187,19 @@ impl EventSink<RtspReceiverEvent<'_>, RtspReceiverEventResult> for AirPlayReceiv
 }
 
 impl RtspReceiverCallback for AirPlayReceiver {}
+
+impl AsyncShutdown for AirPlayReceiver {
+    async fn shutdown(&mut self) {
+        self.streams.shutdown().await;
+        self.streams = Streams::default();
+        if std::mem::take(&mut self.sink_had_init) {
+            self.sink.shutdown().await;
+        }
+        // The sink can publish its disconnect while still owning the lock.
+        // A later Drop must not publish a second, stale disconnect.
+        self.lock.take();
+    }
+}
 
 impl Drop for AirPlayReceiver {
     fn drop(&mut self) {
@@ -253,6 +269,18 @@ impl AirPlayReceiver {
         }
 
         self.event_loop.take();
+        Ok(())
+    }
+
+    async fn reconcile_mirroring_screen_status(&mut self) -> RtspResult<()> {
+        if self.profile.is_picture_only()
+            && let Some(screen) = self.streams.screen.as_mut()
+            && let Err(error) = screen.reconcile().await
+        {
+            self.sink
+                .on_receiver_diagnostic(AirPlayReceiverDiagnostic::ScreenTerminated);
+            return Err(error.unwrap_or(RtspError::Closed));
+        }
         Ok(())
     }
 
@@ -360,6 +388,13 @@ impl AirPlayReceiver {
 
                 features |= AirPlayFeature::AUDIO_AAC_LC;
             }
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            AirPlayReceiverProfile::AppleTVH264VideoOnly => {
+                features |= AirPlayFeature::SCREEN;
+                features |= AirPlayFeature::UNIFIED_BONJOUR;
+                features |= AirPlayFeature::VIDEO_FAIRPLAY;
+                features |= AirPlayFeature::AUTHENTICATION4;
+            }
             AirPlayReceiverProfile::AppleTV => {
                 features |= AirPlayFeature::AUDIO;
                 // features |= AirPlayFeature::REDUNDANT_AUDIO;
@@ -402,23 +437,27 @@ impl AirPlayReceiver {
             protovers: AIRPLAY_PROTO_VERS.into(),
             model: match profile {
                 AirPlayReceiverProfile::CarPlay => AIRPLAY_MODEL_BRAND_CARPLAY,
-                AirPlayReceiverProfile::AppleTV => AIRPLAY_MODEL_BRAND_MIRROR,
+                _ => AIRPLAY_MODEL_BRAND_MIRROR,
             }
             .into(),
             features: AirPlayReceiver::features(profile),
-            flags: AirPlayStatus::AUDIO,
+            flags: if profile.is_picture_only() {
+                AirPlayStatus::empty()
+            } else {
+                AirPlayStatus::AUDIO
+            },
             deviceid: match profile {
                 AirPlayReceiverProfile::CarPlay => format!("{}", device_id),
-                AirPlayReceiverProfile::AppleTV => format!("{}_atv", device_id),
+                _ => format!("{}_atv", device_id),
             },
 
             vv: match profile {
                 AirPlayReceiverProfile::CarPlay => "".into(),
-                AirPlayReceiverProfile::AppleTV => "2".into(),
+                _ => "2".into(),
             },
             pw: match profile {
                 AirPlayReceiverProfile::CarPlay => "".into(),
-                AirPlayReceiverProfile::AppleTV => "false".into(),
+                _ => "false".into(),
             },
             // ..Default::default()
         }
@@ -540,9 +579,27 @@ impl AirPlayReceiver {
 
         r.modes = self.sink.init_modes();
 
-        Self::setup_audio_defaults(&mut r);
+        if !self.profile.is_picture_only() {
+            Self::setup_audio_defaults(&mut r);
+        }
 
         self.sink.on_info(&mut r).await;
+        if self.profile.is_picture_only() {
+            // A general CarPlay sink may have copied car capabilities into /info.
+            // Picture-only capabilities remain consistent with Bonjour.
+            r.features = self.features;
+            r.status_flags = AirPlayStatus::empty();
+            r.audio_formats.clear();
+            r.audio_latencies.clear();
+            r.hevc_info = None;
+            r.extended_features.clear();
+            r.hid_devices.clear();
+            r.hid_languages.clear();
+            r.bluetooth_ids.clear();
+            r.modes = Default::default();
+            r.model = "AppleTV3,2".into();
+            r.name = "CatPlay AirPlay".into();
+        }
         self.modes = AirPlayModeState::new(&r.modes);
 
         if self.features.contains(AirPlayFeature::CAR) && Self::CARPLAY_FORCE_HEVC {
@@ -561,6 +618,22 @@ impl AirPlayReceiver {
         let data: Setup = req.get_plist()?;
         debug!("plist data: {data:?}");
 
+        if self.profile.is_picture_only()
+            && (data.streams.len() != 1 || !matches!(data.streams.first(), Some(StreamDescription::Screen(_))))
+        {
+            let has_audio = data
+                .streams
+                .iter()
+                .any(|stream| matches!(stream, StreamDescription::Audio(_) | StreamDescription::AudioLegacy(_)));
+            self.sink.on_receiver_diagnostic(if has_audio {
+                AirPlayReceiverDiagnostic::AudioUnsupported
+            } else {
+                AirPlayReceiverDiagnostic::UnsupportedStreamSetup
+            });
+            return Err(RtspError::ProtocolViolation(
+                "picture-only mirroring requires one screen per stream SETUP",
+            ));
+        }
         let mut streams_resp = SetupResponse::default();
         for stream in data.streams {
             let sdr = self.setup_stream(stream).await?;
@@ -604,6 +677,11 @@ impl AirPlayReceiver {
             return Err(HttpStatus::BadRequest)?;
         }
 
+        if self.profile.is_picture_only() && self.streams.media_clock.is_none() {
+            return Err(RtspError::ProtocolViolation(
+                "picture-only screen SETUP requires completed initial SETUP",
+            ));
+        }
         info!("Opening screen stream with latency {:?}", stream.latency_ms);
 
         let latency = Duration::from_millis(stream.latency_ms.unwrap_or(0));
@@ -615,8 +693,16 @@ impl AirPlayReceiver {
             }
         };
 
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        if self.profile.is_picture_only() {
+            screen_sink = Box::new(super::picture_only::PictureOnlyScreenSink::new(screen_sink));
+        }
+
         if let Err(err) = screen_sink.init().await {
             error!("Failed to initialize video sink: {err}");
+            if self.profile.is_picture_only() {
+                screen_sink.shutdown().await;
+            }
             return Err(RtspError::Code(HttpStatus::InternalServerError));
         }
 
@@ -635,13 +721,18 @@ impl AirPlayReceiver {
             media_clock.boxed(),
         );
 
-        let (helper, local) = spawn_fork("screen_rx", move || TcpHelper::accept_timeout(bind_ip, Self::TCP_REVERSE_CONN_TIMEOUT, recv))?;
+        let (helper, local) = spawn_fork("screen_rx", move || {
+            TcpHelper::accept_timeout(bind_ip, Self::TCP_REVERSE_CONN_TIMEOUT, recv)
+        })?;
         self.streams.screen.replace(helper);
 
         Ok(StreamDescriptionResponse::new_screen(local.port()))
     }
 
     async fn setup_audio(&mut self, mut stream: StreamDescriptionAudio) -> RtspResult<StreamDescriptionResponse> {
+        if self.profile.is_picture_only() {
+            return Err(RtspError::ProtocolViolation("picture-only mirroring does not support audio"));
+        }
         let audio_stream = match stream.stream_type {
             StreamType::GeneralAudio | StreamType::MainAudio | StreamType::MainHighAudio => &mut self.streams.main_audio,
             StreamType::AltAudio => &mut self.streams.alt_audio,
@@ -761,6 +852,19 @@ impl AirPlayReceiver {
     }
 
     async fn respond_setup_initial(&mut self, req: &RtspRequest, resp: &mut RtspResponse) -> RtspResult<()> {
+        let result = self.respond_setup_initial_inner(req, resp).await;
+        if let Err(err) = &result {
+            if self.profile.is_picture_only() {
+                self.sink
+                    .on_receiver_diagnostic(AirPlayReceiverDiagnostic::InitialSetupFailed);
+            }
+            self.state.change(AirPlayReceiverState::Closed(err.clone()));
+            self.shutdown().await;
+        }
+        result
+    }
+
+    async fn respond_setup_initial_inner(&mut self, req: &RtspRequest, resp: &mut RtspResponse) -> RtspResult<()> {
         if self.state != AirPlayReceiverState::InitialSetup {
             return Err(RtspError::ProtocolViolation("initial setup in invalid state"));
         }
@@ -769,6 +873,53 @@ impl AirPlayReceiver {
 
         let data: InitialSetup = req.get_plist()?;
         debug!("Initial Setup: {data:?}");
+        if self.profile.is_picture_only() {
+            self.sink
+                .on_initial_setup_observation(AirPlayInitialSetupObservation {
+                    timing_protocol: match data.timing_protocol.as_deref() {
+                        None => AirPlayObservedTimingProtocol::Absent,
+                        Some("NTP") => AirPlayObservedTimingProtocol::Ntp,
+                        Some("PTP") => AirPlayObservedTimingProtocol::Ptp,
+                        _ => AirPlayObservedTimingProtocol::Other,
+                    },
+                    stream_count: data.streams.as_ref().map_or(0, Vec::len),
+                    stream_types: data
+                        .streams
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .take(8)
+                        .map(|stream| match stream {
+                            StreamDescription::AudioLegacy(audio) => audio.stream_type,
+                            StreamDescription::Audio(audio) => audio.stream_type,
+                            StreamDescription::Screen(screen) => screen.stream_type,
+                            _ => StreamType::Invalid,
+                        })
+                        .collect(),
+                    encryption_type_bits: data.et.map(|et| et.bits()),
+                    is_screen_mirroring_session: data.is_screen_mirroring_session,
+                });
+            if data
+                .streams
+                .as_ref()
+                .is_some_and(|streams| !streams.is_empty())
+            {
+                self.sink
+                    .on_receiver_diagnostic(AirPlayReceiverDiagnostic::UnsupportedInitialStreams);
+                return Err(RtspError::ProtocolViolation(
+                    "picture-only mirroring requires separate initial and stream SETUP",
+                ));
+            }
+            if data
+                .timing_protocol
+                .as_deref()
+                .is_some_and(|protocol| protocol != "NTP")
+            {
+                self.sink
+                    .on_receiver_diagnostic(AirPlayReceiverDiagnostic::UnsupportedTimingProtocol);
+                return Err(RtspError::ProtocolViolation("picture-only mirroring supports only NTP timing"));
+            }
+        }
 
         if let Some(et) = data.et {
             // Fun fact about mirroring: iOS enforces FairPlay, but if you add HomeKit pairing to the mix...
@@ -834,6 +985,19 @@ impl AirPlayReceiver {
             info!("Using HomeKit ChaCha for media streams encryption");
         }
 
+        if self.profile.is_picture_only()
+            && !matches!(
+                self.stream_encryption,
+                AirPlayStreamEncryption::Aes { .. } | AirPlayStreamEncryption::ChaCha { .. }
+            )
+        {
+            self.sink
+                .on_receiver_diagnostic(AirPlayReceiverDiagnostic::MissingMediaEncryption);
+            return Err(RtspError::ProtocolViolation(
+                "picture-only mirroring requires negotiated media encryption",
+            ));
+        }
+
         let mut bind_ip = self.bind_ip;
         bind_ip.set_port(0);
 
@@ -848,27 +1012,17 @@ impl AirPlayReceiver {
             events.replace(self.do_setup_events().await?);
         }
 
-        let handle = Arc::new(AirPlayReceiverHandleImpl::new(
+        let handle = Arc::new(AirPlayReceiverHandleImpl::new_with_profile(
             self.streams.event_rtsp.clone(),
             media_clock.clone(),
             self.task_queue_tx.clone(),
             &self.iface,
             self.wireless,
             self.close_pending_tx.clone(),
+            self.profile,
         ));
 
-        self.sink.init(handle.clone())?;
-        self.sink_had_init = true;
-
-        let lock = self.shared.lock(handle.clone());
-        if lock.is_none() {
-            warn!("Rejected incoming AirPlay connection, because session is already active!");
-            return Err(RtspError::Code(HttpStatus::NotEnoughBandwidth));
-        }
-
-        self.lock.replace(lock.unwrap());
-
-        self.sink.on_initial_setup().await?;
+        self.initialize_sink_under_lock(handle.clone()).await?;
 
         if self.features.contains(AirPlayFeature::CAR) && self.wireless {
             self.init_iap2(handle.clone()).await;
@@ -898,6 +1052,25 @@ impl AirPlayReceiver {
         Ok(())
     }
 
+    async fn initialize_sink_under_lock(&mut self, handle: AirPlayReceiverHandleRef) -> RtspResult<()> {
+        let Some(lock) = self.shared.lock(handle.clone()) else {
+            warn!("Rejected incoming AirPlay connection, because session is already active!");
+            return Err(RtspError::Code(HttpStatus::NotEnoughBandwidth));
+        };
+        self.lock.replace(lock);
+        // An init implementation can allocate resources and then fail.
+        self.sink_had_init = true;
+        let result = match self.sink.init(handle) {
+            Ok(()) => self.sink.on_initial_setup().await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = &result {
+            self.state.change(AirPlayReceiverState::Closed(err.clone()));
+            self.shutdown().await;
+        }
+        result
+    }
+
     async fn do_setup_events(&mut self) -> RtspResult<u16> {
         let secret = self.pairing.shared_secret();
 
@@ -919,6 +1092,11 @@ impl AirPlayReceiver {
     }
 
     async fn respond_command(&mut self, req: &RtspRequest, resp: &mut RtspResponse) -> RtspResult<()> {
+        if self.profile.is_picture_only() {
+            return Err(RtspError::ProtocolViolation(
+                "picture-only mirroring does not support CarPlay commands",
+            ));
+        }
         match Command::deserialize_caching(&req.payload, &mut self.serializer) {
             Err(err) => {
                 warn!("Failed to deserialize command: {err:?}");
@@ -975,5 +1153,325 @@ impl AirPlayReceiver {
     fn is_idle(&self) -> bool {
         let s = &self.streams;
         s.main_audio.is_none() && s.alt_audio.is_none() && s.screen.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use catplay_hap::HomekitStorageFile;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Calls {
+        init: usize,
+        setup: usize,
+        shutdown: usize,
+        audio: usize,
+        lock_at_init: bool,
+        lock_at_shutdown: bool,
+        observations: Vec<AirPlayInitialSetupObservation>,
+        diagnostics: Vec<AirPlayReceiverDiagnostic>,
+    }
+
+    struct CountingSink {
+        calls: Arc<Mutex<Calls>>,
+        shared: AirPlayServerShared,
+        fail_init: bool,
+        fail_setup: bool,
+    }
+
+    #[async_trait]
+    impl crate::carplay_rx::AirPlayReceiverSink for CountingSink {
+        fn init(&mut self, _handle: AirPlayReceiverHandleRef) -> RtspResult<()> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.init += 1;
+            calls.lock_at_init = self.shared.borrow().is_some();
+            if self.fail_init { Err(RtspError::NotSupported) } else { Ok(()) }
+        }
+
+        async fn on_initial_setup(&mut self) -> RtspResult<()> {
+            self.calls.lock().unwrap().setup += 1;
+            if self.fail_setup { Err(RtspError::NotSupported) } else { Ok(()) }
+        }
+
+        async fn on_info(&mut self, info: &mut InfoMessageResponse) {
+            // Model a generic bridge that copies all car capabilities into /info.
+            info.features = AirPlayReceiver::features(AirPlayReceiverProfile::CarPlay);
+            info.model = "CarPlay".into();
+            info.hevc_info = Some(HevcInfo::default());
+            AirPlayReceiver::setup_audio_defaults(info);
+        }
+
+        fn on_initial_setup_observation(&mut self, observation: AirPlayInitialSetupObservation) {
+            self.calls.lock().unwrap().observations.push(observation);
+        }
+
+        fn on_receiver_diagnostic(&mut self, diagnostic: AirPlayReceiverDiagnostic) {
+            self.calls.lock().unwrap().diagnostics.push(diagnostic);
+        }
+
+        async fn open_audio(
+            &mut self,
+            _latency: Duration,
+            _stream_type: StreamType,
+            _audio_type: crate::msg::AudioType,
+            _audio_format: crate::msg::AudioFormat,
+            _pcm_format: crate::audio::AudioStreamBasicDescription,
+            _duplex: bool,
+        ) -> RtspResult<crate::audio::AudioPlayerBox<i16>> {
+            self.calls.lock().unwrap().audio += 1;
+            Err(RtspError::NotSupported)
+        }
+    }
+
+    impl EventReconciler for CountingSink {
+        type Error = RtspError;
+    }
+    impl EventSleeper for CountingSink {}
+    impl AsyncShutdown for CountingSink {
+        async fn shutdown(&mut self) {
+            let mut calls = self.calls.lock().unwrap();
+            calls.shutdown += 1;
+            calls.lock_at_shutdown = self.shared.borrow().is_some();
+        }
+    }
+
+    fn receiver(
+        profile: AirPlayReceiverProfile,
+        shared: AirPlayServerShared,
+        fail_init: bool,
+        fail_setup: bool,
+    ) -> (AirPlayReceiver, Arc<Mutex<Calls>>) {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let sink = CountingSink {
+            calls: calls.clone(),
+            shared: shared.clone(),
+            fail_init,
+            fail_setup,
+        };
+        (
+            AirPlayReceiver::new(
+                "lo",
+                MacAddr6::new(2, 0, 0, 0, 0, 1),
+                HomekitStorageFile::memory(),
+                None,
+                shared,
+                Box::new(sink),
+                profile,
+            ),
+            calls,
+        )
+    }
+
+    fn handle(receiver: &AirPlayReceiver) -> AirPlayReceiverHandleRef {
+        Arc::new(AirPlayReceiverHandleImpl::new_with_profile(
+            None,
+            TimingClient::new().1,
+            receiver.task_queue_tx.clone(),
+            "lo",
+            true,
+            receiver.close_pending_tx.clone(),
+            receiver.profile,
+        ))
+    }
+
+    #[tokio::test]
+    async fn admission_holds_lock_during_init_and_shutdown_and_is_idempotent() {
+        let shared = AirPlayServerShared::new();
+        let (mut receiver, calls) = receiver(AirPlayReceiverProfile::AppleTV, shared.clone(), false, false);
+        receiver
+            .initialize_sink_under_lock(handle(&receiver))
+            .await
+            .unwrap();
+        assert!(calls.lock().unwrap().lock_at_init);
+        assert!(shared.borrow().is_some());
+        receiver.shutdown().await;
+        receiver.shutdown().await;
+        let calls = calls.lock().unwrap();
+        assert_eq!((calls.init, calls.setup, calls.shutdown), (1, 1, 1));
+        assert!(calls.lock_at_shutdown);
+        assert!(shared.borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn competing_connection_does_not_initialize_or_shutdown_sink() {
+        let shared = AirPlayServerShared::new();
+        let (mut first, _) = receiver(AirPlayReceiverProfile::AppleTV, shared.clone(), false, false);
+        first
+            .initialize_sink_under_lock(handle(&first))
+            .await
+            .unwrap();
+        let owner = shared.borrow().unwrap();
+        let (mut rejected, calls) = receiver(AirPlayReceiverProfile::AppleTV, shared.clone(), false, false);
+        assert!(
+            rejected
+                .initialize_sink_under_lock(handle(&rejected))
+                .await
+                .is_err()
+        );
+        rejected.shutdown().await;
+        drop(rejected);
+        assert!(Arc::ptr_eq(&owner, &shared.borrow().unwrap()));
+        assert_eq!(calls.lock().unwrap().init, 0);
+        assert_eq!(calls.lock().unwrap().shutdown, 0);
+        first.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_init_and_failed_setup_clean_partial_sink_before_unlocking() {
+        for (fail_init, fail_setup) in [(true, false), (false, true)] {
+            let shared = AirPlayServerShared::new();
+            let (mut receiver, calls) = receiver(AirPlayReceiverProfile::AppleTV, shared.clone(), fail_init, fail_setup);
+            assert!(
+                receiver
+                    .initialize_sink_under_lock(handle(&receiver))
+                    .await
+                    .is_err()
+            );
+            assert!(matches!(receiver.state, AirPlayReceiverState::Closed(_)));
+            assert!(shared.borrow().is_none());
+            receiver.shutdown().await;
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.init, 1);
+            assert_eq!(calls.setup, usize::from(!fail_init));
+            assert_eq!(calls.shutdown, 1);
+            assert!(calls.lock_at_shutdown);
+        }
+    }
+
+    #[test]
+    fn original_profiles_keep_their_capabilities() {
+        let base = AirPlayFeature::AUDIO
+            | AirPlayFeature::AUDIO_PCM
+            | AirPlayFeature::AUDIO_UNENCRYPTED
+            | AirPlayFeature::SCREEN
+            | AirPlayFeature::ROTATE
+            | AirPlayFeature::UNIFIED_BONJOUR
+            | AirPlayFeature::AUDIO_AAC_LC;
+        assert_eq!(
+            AirPlayReceiver::features(AirPlayReceiverProfile::CarPlay),
+            base | AirPlayFeature::AUDIO_AES_128_MFI_SAP_V1
+                | AirPlayFeature::CAR
+                | AirPlayFeature::CARPLAY_CONTROL
+                | AirPlayFeature::HK_PAIRING_AND_ENCRYPT
+        );
+        assert_eq!(
+            AirPlayReceiver::features(AirPlayReceiverProfile::AppleTV),
+            base | AirPlayFeature::AUDIO_AAC_ELD
+                | AirPlayFeature::AUDIO_ALAC
+                | AirPlayFeature::VIDEO_FAIRPLAY
+                | AirPlayFeature::AUTHENTICATION4
+                | AirPlayFeature::SUPPORTS_SCREEN_MULTI_CODEC
+        );
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    #[tokio::test]
+    async fn picture_only_info_and_bonjour_refuse_audio_hevc_and_carplay_overrides() {
+        let profile = AirPlayReceiverProfile::AppleTVH264VideoOnly;
+        let (mut receiver, _) = receiver(profile, AirPlayServerShared::new(), false, false);
+        let mut response = RtspResponse::new(None, HttpStatus::Ok);
+        receiver
+            .respond_info(&RtspRequest::get("/info"), &mut response)
+            .await
+            .unwrap();
+        let info: InfoMessageResponse = response.get_plist().unwrap();
+        let bonjour = AirPlayReceiver::bonjour(profile, receiver.homekit.clone(), receiver.mac_addr);
+        assert_eq!(info.features, bonjour.features);
+        assert_eq!(info.status_flags, AirPlayStatus::empty());
+        assert_eq!(bonjour.flags, AirPlayStatus::empty());
+        assert!(info.audio_formats.is_empty() && info.audio_latencies.is_empty());
+        assert!(info.hevc_info.is_none() && info.extended_features.is_empty());
+        assert!(info.modes.resources.is_empty() && info.modes.app_states.is_empty());
+        assert!(info.bluetooth_ids.is_empty());
+        assert_eq!(info.model, "AppleTV3,2");
+        assert!(
+            info.features
+                .contains(AirPlayFeature::SCREEN | AirPlayFeature::VIDEO_FAIRPLAY)
+        );
+        assert!(
+            !info
+                .features
+                .intersects(AirPlayFeature::AUDIO | AirPlayFeature::CAR | AirPlayFeature::SUPPORTS_SCREEN_MULTI_CODEC)
+        );
+        let handle = handle(&receiver);
+        assert!(handle.is_mirroring() && !handle.is_car());
+        assert!(matches!(
+            handle.send_command(Command::ForceKeyFrame(crate::msg::CommandForceKeyFrame {})),
+            Err(RtspError::EventsUnsupported)
+        ));
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    #[tokio::test]
+    async fn picture_only_audio_and_mixed_stream_setup_fail_before_sink_allocation() {
+        let (mut receiver, calls) = receiver(
+            AirPlayReceiverProfile::AppleTVH264VideoOnly,
+            AirPlayServerShared::new(),
+            false,
+            false,
+        );
+        receiver.state = AirPlayReceiverState::PreRecord;
+        let audio = StreamDescriptionAudio::default();
+        assert!(receiver.setup_audio(audio).await.is_err());
+        let setup = Setup::new(&[
+            StreamDescriptionScreen::new(1, Duration::ZERO, "test").into(),
+            StreamDescriptionAudio::default().into(),
+        ]);
+        let request = RtspRequest::with_plist(crate::rtsp_frame::RtspMethod::Setup, "/stream", setup).unwrap();
+        assert!(
+            receiver
+                .respond_setup(&request, &mut RtspResponse::new(None, HttpStatus::Ok))
+                .await
+                .is_err()
+        );
+        assert!(receiver.streams.screen.is_none());
+        assert_eq!(calls.lock().unwrap().audio, 0);
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    #[tokio::test]
+    async fn picture_only_initial_setup_reports_safe_shape_and_rejects_unimplemented_forms() {
+        for (setup, diagnostic) in [
+            (
+                InitialSetup {
+                    timing_protocol: Some("PTP".into()),
+                    ..Default::default()
+                },
+                AirPlayReceiverDiagnostic::UnsupportedTimingProtocol,
+            ),
+            (
+                InitialSetup {
+                    streams: Some(vec![StreamDescriptionScreen::new(1, Duration::ZERO, "test").into()]),
+                    ..Default::default()
+                },
+                AirPlayReceiverDiagnostic::UnsupportedInitialStreams,
+            ),
+            (InitialSetup::default(), AirPlayReceiverDiagnostic::MissingMediaEncryption),
+            (
+                InitialSetup {
+                    et: Some(AirPlayEncryptionType::NONE),
+                    ..Default::default()
+                },
+                AirPlayReceiverDiagnostic::MissingMediaEncryption,
+            ),
+        ] {
+            let shared = AirPlayServerShared::new();
+            let (mut receiver, calls) = receiver(AirPlayReceiverProfile::AppleTVH264VideoOnly, shared.clone(), false, false);
+            let request = RtspRequest::with_plist(crate::rtsp_frame::RtspMethod::Setup, "/initial", setup).unwrap();
+            assert!(
+                receiver
+                    .respond_setup_initial(&request, &mut RtspResponse::new(None, HttpStatus::Ok))
+                    .await
+                    .is_err()
+            );
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.observations.len(), 1);
+            assert!(calls.diagnostics.contains(&diagnostic));
+            assert_eq!((calls.init, calls.shutdown), (0, 0));
+            assert!(shared.borrow().is_none());
+            assert!(matches!(receiver.state, AirPlayReceiverState::Closed(_)));
+        }
     }
 }

@@ -88,7 +88,8 @@ impl AirPlayServer {
     pub fn start_advertise(&mut self) -> io::Result<()> {
         let bonjour = Bonjour::with_iface(&self.iface, BonjourType::Ipv6AndIpv4)?;
         let entry = AirPlayReceiver::bonjour(self.profile, self.homekit.clone(), self.mac_addr);
-        let handle = bonjour.register::<AirPlayBonjourEntry>(entry, "carplay.local.", "carplay", self.port, &[])?;
+        let (hostname, instance) = self.advertisement_names();
+        let handle = bonjour.register::<AirPlayBonjourEntry>(entry, &hostname, &instance, self.port, &[])?;
 
         self.bonjour_entry.replace(handle);
         self.bonjour.replace(bonjour);
@@ -97,7 +98,22 @@ impl AirPlayServer {
         Ok(())
     }
 
+    fn advertisement_names(&self) -> (String, String) {
+        if self.profile.is_picture_only() {
+            let suffix = self
+                .mac_addr
+                .to_string()
+                .replace(':', "")
+                .to_ascii_lowercase();
+            return (format!("catplay-mirror-{suffix}.local."), format!("CatPlay Mirror Probe {suffix}"));
+        }
+        ("carplay.local.".into(), "carplay".into())
+    }
+
     pub fn start_inviting(&mut self) -> bool {
+        if !self.profile.is_car() {
+            return false;
+        }
         let Some(bonjour) = self.bonjour.as_ref() else {
             return false;
         };
@@ -121,12 +137,85 @@ impl AirPlayServer {
 
 impl AsyncShutdown for AirPlayServer {
     async fn shutdown(&mut self) {
-        // TODO
+        self.stop_inviting();
+        if let Some(entry) = self.bonjour_entry.take() {
+            entry.close();
+        }
+        self.bonjour.take();
+        if let Some(mut listener) = self.listener_handle.take() {
+            // The listener cancellation token is inherited by its accepted
+            // connections. Do not close sessions owned by other shared servers.
+            listener.shutdown().await;
+        }
     }
 }
 
 impl Drop for AirPlayServer {
     fn drop(&mut self) {
         debug!("AirPlayServer was dropped!");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rtsp_frame::RtspError;
+    use catplay_hap::HomekitStorageFile;
+    use catplay_util::{EventReconciler, EventSleeper};
+
+    struct Sink;
+    #[async_trait::async_trait]
+    impl AirPlayReceiverSink for Sink {}
+    impl EventSleeper for Sink {}
+    impl EventReconciler for Sink {
+        type Error = RtspError;
+    }
+    impl AsyncShutdown for Sink {}
+
+    fn server(profile: AirPlayReceiverProfile) -> AirPlayServer {
+        AirPlayServer::new(
+            7001,
+            MacAddr6::new(2, 0, 0, 0, 0, 1),
+            "lo",
+            HomekitStorageFile::memory(),
+            None,
+            AirPlayServerShared::new(),
+            profile,
+            || Sink,
+        )
+    }
+
+    #[test]
+    fn legacy_discovery_names_remain_unchanged_and_mirror_does_not_invite() {
+        for profile in [AirPlayReceiverProfile::CarPlay, AirPlayReceiverProfile::AppleTV] {
+            assert_eq!(server(profile).advertisement_names(), ("carplay.local.".into(), "carplay".into()));
+        }
+        let mut mirror = server(AirPlayReceiverProfile::AppleTV);
+        assert!(!mirror.start_inviting());
+        assert!(mirror.inviter.is_none());
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    #[test]
+    fn experimental_discovery_is_distinct_and_never_invites() {
+        let mut mirror = server(AirPlayReceiverProfile::AppleTVH264VideoOnly);
+        assert_eq!(
+            mirror.advertisement_names(),
+            (
+                "catplay-mirror-020000000001.local.".into(),
+                "CatPlay Mirror Probe 020000000001".into()
+            )
+        );
+        assert!(!mirror.start_inviting());
+        assert!(mirror.inviter.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_server_shutdown_is_idempotent() {
+        let mut server = server(AirPlayReceiverProfile::CarPlay);
+        server.shutdown().await;
+        server.shutdown().await;
+        assert!(server.listener_handle.is_none());
+        assert!(server.bonjour_entry.is_none());
     }
 }

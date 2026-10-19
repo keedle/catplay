@@ -18,6 +18,10 @@ jobs:
     if: github.repository == 'keedle/catplay'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", experimental_airplay_mirroring]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,7 +37,12 @@ jobs:
           cargo +1.99.1 --version
           git rev-parse HEAD
       - name: Protocol library and integration tests
-        run: cargo +1.99.1 test --locked -p catplay_carplay --lib --tests
+        run: cargo +1.99.1 test --locked -p catplay_carplay --features "${{ matrix.features }}" --lib --tests
+      - name: Build and test receiver probe without starting a listener
+        if: matrix.features == 'experimental_airplay_mirroring'
+        run: |
+          cargo +1.99.1 build --locked -p catplay_carplay --features experimental_airplay_mirroring --example airplay_mirror_probe
+          cargo +1.99.1 test --locked -p catplay_carplay --features experimental_airplay_mirroring --example airplay_mirror_probe
       - name: Portable experiments
         run: |
           cargo +1.99.1 test --locked --manifest-path experiments/airplay-mirroring/Cargo.toml

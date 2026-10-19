@@ -1,6 +1,8 @@
 mod audio_defaults;
 mod cp_inviter;
 mod receiver;
+#[cfg(feature = "experimental_airplay_mirroring")]
+mod picture_only;
 mod server;
 mod session_guard;
 mod session_handle;
