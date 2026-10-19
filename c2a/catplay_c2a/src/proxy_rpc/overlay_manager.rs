@@ -47,6 +47,8 @@ pub struct OverlayManager {
     mirror_screen: Option<super::MirrorBridgeReceiver>,
     #[cfg(feature = "experimental_airplay_mirroring")]
     mirror_last_config: Option<catplay_carplay::video::AvccConfigExtended>,
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    mirror_revision: Option<usize>,
     policy: OverlayPolicyDefault,
     // stream_state: ResourceTransferType,
 }
@@ -79,6 +81,8 @@ impl OverlayManager {
             mirror_screen: None,
             #[cfg(feature = "experimental_airplay_mirroring")]
             mirror_last_config: None,
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            mirror_revision: None,
             policy: OverlayPolicyDefault::new(),
             lazy_screen: None,
         }
@@ -111,6 +115,14 @@ impl OverlayManager {
         }
         self.mirror_screen = Some(receiver);
         self.mirror_last_config = None;
+        self.mirror_revision = None;
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn has_mirror_screen(&self) -> bool {
+        self.mirror_screen
+            .as_ref()
+            .is_some_and(|screen| !screen.is_closed())
     }
 
     #[cfg(feature = "experimental_airplay_mirroring")]
@@ -124,17 +136,45 @@ impl OverlayManager {
     }
 
     #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn recover_mirror_stream(&mut self) {
+        if let Some(receiver) = self.mirror_screen.as_mut() {
+            receiver.invalidate_until_idr();
+        }
+        if let Some(screen) = self.lazy_screen.as_mut() {
+            screen.reset_for_keyframe();
+        }
+        self.mirror_last_config = None;
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
     async fn reconcile_mirror(&mut self) {
         let Some(receiver) = self.mirror_screen.as_mut() else {
             return;
         };
-        if receiver.is_closed() {
-            if let Some(handle) = self.mirror_peer.as_ref() {
-                handle.close(catplay_carplay::rtsp_frame::RtspError::Closed);
-            }
-            self.mirror_screen.take();
+        if receiver.recovery_expired() {
+            self.fail_mirror_stream();
             return;
         }
+        if receiver.is_closed() {
+            // Explicit screen TEARDOWN ends this stream, not the RTSP owner.
+            // Socket/protocol failures are escalated by the receiver itself.
+            self.mirror_screen.take();
+            self.retire_mirror_car_stream();
+            return;
+        }
+        let revision = receiver.revision();
+        if self
+            .mirror_revision
+            .is_some_and(|previous| previous != revision)
+        {
+            // Reset as soon as config/loss changes, even before a new IDR is
+            // available. Already-written TCP bytes cannot be retracted.
+            if let Some(screen) = self.lazy_screen.as_mut() {
+                screen.reset_for_keyframe();
+            }
+            self.mirror_last_config = None;
+        }
+        self.mirror_revision = Some(revision);
         let Some(screen) = self.lazy_screen.as_mut() else {
             return;
         };
@@ -151,19 +191,18 @@ impl OverlayManager {
             return;
         }
         if frame.config.is_some() && self.mirror_last_config.is_some() && self.mirror_last_config != frame.config {
-            // A new stream cannot share queued media or cached state with the
-            // prior configuration. Dropping the guard schedules real TEARDOWN.
-            self.lazy_screen.take();
+            // The bridge supplied a newly validated IDR and config. Discard
+            // stale queued output while preserving TCP/crypto state, then send
+            // Configure immediately before this first frame of the new stream.
+            screen.reset_for_keyframe();
             self.mirror_last_config = None;
-            self.fail_mirror_stream();
-            return;
         }
         if let Some(config) = frame.config.as_ref() {
             self.mirror_last_config = Some(config.clone());
         }
         let result = tokio::time::timeout(Duration::from_millis(100), screen.push_frame(frame)).await;
         if !matches!(result, Ok(Ok(()))) {
-            self.fail_mirror_stream();
+            self.recover_mirror_stream();
         }
     }
 
@@ -172,6 +211,9 @@ impl OverlayManager {
     #[cfg(feature = "experimental_airplay_mirroring")]
     pub fn retire_mirror_car_stream(&mut self) {
         self.mirror_last_config = None;
+        if let Some(screen) = self.lazy_screen.as_mut() {
+            screen.reset_for_keyframe();
+        }
         self.lazy_screen.take();
     }
 
@@ -395,7 +437,7 @@ impl OverlayManager {
     pub fn force_keyframe(&mut self) {
         #[cfg(feature = "experimental_airplay_mirroring")]
         if self.mirror_peer.is_some() {
-            self.fail_mirror_stream();
+            self.recover_mirror_stream();
             return;
         }
         if let Some(iphone) = self.iphone_peer.as_ref() {
@@ -573,7 +615,7 @@ mod mirror_forwarding_tests {
     }
 
     #[tokio::test]
-    async fn unsupported_reconfiguration_closes_bridge_and_retires_old_car_stream() {
+    async fn compatible_reconfiguration_reuses_tcp_and_queues_config_before_idr() {
         let mut overlay = OverlayManager::new(800, 480, 30, 160.0, None);
         overlay.enable_mirroring();
         overlay.set_mirror_peer(Some(handle()));
@@ -584,18 +626,25 @@ mod mirror_forwarding_tests {
         sink.set_avcc_config(config()).await.unwrap();
         sink.process_frame(frame(true)).await.unwrap();
         overlay.reconcile().await;
-        queue.lock().unwrap().clear();
         let mut next = config();
         next.video_latency = Duration::from_millis(50);
         sink.set_avcc_config(next.clone()).await.unwrap();
+        overlay.reconcile().await;
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "old queued media must leave before the recovery IDR"
+        );
         let mut idr = frame(true);
         idr.config = Some(next);
         sink.process_frame(idr).await.unwrap();
         overlay.reconcile().await;
-        assert!(overlay.mirror_screen.as_ref().unwrap().is_closed());
-        assert!(queue.lock().unwrap().is_empty());
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert!(!overlay.has_car_peer());
+        assert!(!overlay.mirror_screen.as_ref().unwrap().is_closed());
+        let ops = queue.lock().unwrap();
+        assert!(matches!(ops.front(), Some(ScreenTransmitOp::Configure(_))));
+        assert!(matches!(ops.back(), Some(ScreenTransmitOp::Frame(frame)) if frame.is_known_keyframe()));
+        assert_eq!(ops.len(), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(overlay.has_car_peer());
     }
 
     #[tokio::test]
@@ -627,6 +676,77 @@ mod mirror_forwarding_tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn no_video_packets_still_expire_initial_idr_wait_and_close_owner() {
+        let mut overlay = OverlayManager::new(800, 480, 30, 160.0, None);
+        overlay.enable_mirroring();
+        let (close_tx, mut close_rx) = mpsc::channel(1);
+        overlay.set_mirror_peer(Some(Arc::new(AirPlayReceiverHandleImpl::new_with_profile(
+            None,
+            TimingClient::new().1,
+            mpsc::unbounded().0,
+            "lo",
+            true,
+            close_tx,
+            AirPlayReceiverProfile::AppleTVH264VideoOnly,
+        ))));
+        let (_sink, receiver) = MirrorBridge::new(MirrorLimits::new(800, 480, 66, 31, 1024).unwrap());
+        overlay.set_mirror_screen(receiver);
+        tokio::time::sleep(Duration::from_millis(3050)).await;
+        // The event loop has a bounded wake even without a producer callback.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), overlay.sleep())
+                .await
+                .is_ok()
+        );
+        overlay.reconcile().await;
+        assert!(matches!(close_rx.try_next(), Ok(Some(_))));
+        assert!(!overlay.has_mirror_screen());
+    }
+
+    #[tokio::test]
+    async fn screen_teardown_keeps_rtsp_owner_and_accepts_fresh_screen() {
+        let mut overlay = OverlayManager::new(800, 480, 30, 160.0, None);
+        overlay.enable_mirroring();
+        let (close_tx, mut close_rx) = mpsc::channel(1);
+        let phone = Arc::new(AirPlayReceiverHandleImpl::new_with_profile(
+            None,
+            TimingClient::new().1,
+            mpsc::unbounded().0,
+            "lo",
+            true,
+            close_tx,
+            AirPlayReceiverProfile::AppleTVH264VideoOnly,
+        ));
+        overlay.set_mirror_peer(Some(phone));
+        let (screen, _, drops) = car_screen();
+        overlay.set_car_peer(screen);
+        let limits = MirrorLimits::new(800, 480, 66, 31, 1024).unwrap();
+        let (mut sink, receiver) = MirrorBridge::new(limits);
+        overlay.set_mirror_screen(receiver);
+        sink.set_avcc_config(config()).await.unwrap();
+        sink.process_frame(frame(true)).await.unwrap();
+        overlay.reconcile().await;
+        sink.shutdown().await;
+        overlay.reconcile().await;
+        assert!(!overlay.has_mirror_screen());
+        assert!(!overlay.has_car_peer());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(close_rx.try_next().is_err(), "screen TEARDOWN must not close RTSP");
+
+        let (mut fresh_sink, fresh_receiver) = MirrorBridge::new(limits);
+        overlay.set_mirror_screen(fresh_receiver);
+        let (fresh_screen, queue, _) = car_screen();
+        overlay.set_car_peer(fresh_screen);
+        fresh_sink.set_avcc_config(config()).await.unwrap();
+        fresh_sink.process_frame(frame(true)).await.unwrap();
+        overlay.reconcile().await;
+        assert!(overlay.has_mirror_screen());
+        assert!(matches!(queue.lock().unwrap().front(), Some(ScreenTransmitOp::Configure(_))));
+        assert!(matches!(queue.lock().unwrap().back(), Some(ScreenTransmitOp::Frame(_))));
+        assert!(close_rx.try_next().is_err());
     }
 
     #[tokio::test]

@@ -180,6 +180,8 @@ pub struct ProdGadgetSession {
     pub proxy_tx: mpsc::UnboundedSender<TxAdapterOp>,
     #[cfg(feature = "experimental_airplay_mirroring")]
     pub mirror_display: Option<(u32, u32)>,
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub mirror_audio_formats: catplay_carplay::msg::AudioFormat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,12 +201,14 @@ fn select_phone_receiver_mode(mirroring_enabled: bool) -> PhoneReceiverMode {
 }
 
 #[cfg(feature = "experimental_airplay_mirroring")]
-fn mirror_target_for_session(session: &ProdGadgetSession) -> Option<(mpsc::UnboundedSender<TxAdapterOp>, u32, u32)> {
+fn mirror_target_for_session(
+    session: &ProdGadgetSession,
+) -> Option<(mpsc::UnboundedSender<TxAdapterOp>, u32, u32, catplay_carplay::msg::AudioFormat)> {
     if session.proxy_tx.is_closed() {
         return None;
     }
     let (width, height) = session.mirror_display?;
-    (width > 0 && height > 0).then(|| (session.proxy_tx.clone(), width, height))
+    (width > 0 && height > 0).then(|| (session.proxy_tx.clone(), width, height, session.mirror_audio_formats))
 }
 
 impl EventSleeper for ProdGadget {
@@ -393,11 +397,15 @@ impl Reconcilable for ProdGadget {
                 return Err(LocalError::MissingMirrorDisplay);
             }
 
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            let mirror_audio_formats = crate::proxy_rpc::mirror_car_pcm_formats(transmitter.info_cached());
             let proxy_chan = mpsc::unbounded();
             let car_state = ProdGadgetSession {
                 proxy_tx: proxy_chan.0,
                 #[cfg(feature = "experimental_airplay_mirroring")]
                 mirror_display,
+                #[cfg(feature = "experimental_airplay_mirroring")]
+                mirror_audio_formats,
             };
 
             let transmitter2 = CarManager::new(transmitter, proxy_chan.1, self.cfg.persist_dir.clone());
@@ -431,7 +439,7 @@ impl Reconcilable for ProdGadget {
                 .unwrap()
                 .as_ref()
                 .and_then(mirror_target_for_session);
-            if let (Some(options), Some((proxy_tx, width, height))) = (self.cfg.mirroring, mirror_target) {
+            if let (Some(options), Some((proxy_tx, width, height, audio_formats))) = (self.cfg.mirroring, mirror_target) {
                 let iface_ready = NcmHelper::find_mac_address(&self.cfg.iface)
                     .ok()
                     .filter(|_| NcmHelper::is_iface_running(&self.cfg.iface).is_ok_and(|running| running))
@@ -439,6 +447,11 @@ impl Reconcilable for ProdGadget {
                 if let Some(mac) = iface_ready {
                     const MIRROR_BIND_PORT: u16 = 7001;
                     let shared = AirPlayServerShared::new();
+                    let profile = if audio_formats.is_empty() {
+                        AirPlayReceiverProfile::AppleTVH264VideoOnly
+                    } else {
+                        AirPlayReceiverProfile::AppleTVH264Mirroring
+                    };
                     let mut server = AirPlayServer::new(
                         MIRROR_BIND_PORT,
                         mac,
@@ -446,8 +459,8 @@ impl Reconcilable for ProdGadget {
                         HomekitStorageFile::memory(),
                         None,
                         shared.clone(),
-                        AirPlayReceiverProfile::AppleTVH264VideoOnly,
-                        move || MirrorRxSession::new(proxy_tx.clone(), options, width, height),
+                        profile,
+                        move || MirrorRxSession::new(proxy_tx.clone(), options, width, height).with_audio_formats(audio_formats),
                     );
                     if let Err(err) = server.bind().await {
                         return Err(LocalError::Rx(CarPlayWirelessGadgetError::AirPlayServer(err.into())));
@@ -580,6 +593,7 @@ mod tests {
         let valid = ProdGadgetSession {
             proxy_tx,
             mirror_display: Some((800, 480)),
+            mirror_audio_formats: catplay_carplay::msg::AudioFormat::PCM_48000_STEREO,
         };
         let target = mirror_target_for_session(&valid).unwrap();
         assert_eq!((target.1, target.2), (800, 480));
@@ -588,6 +602,7 @@ mod tests {
         let missing = ProdGadgetSession {
             proxy_tx,
             mirror_display: None,
+            mirror_audio_formats: catplay_carplay::msg::AudioFormat::PCM_48000_STEREO,
         };
         assert!(mirror_target_for_session(&missing).is_none());
 
@@ -595,6 +610,7 @@ mod tests {
         let zero = ProdGadgetSession {
             proxy_tx,
             mirror_display: Some((800, 0)),
+            mirror_audio_formats: catplay_carplay::msg::AudioFormat::PCM_48000_STEREO,
         };
         assert!(mirror_target_for_session(&zero).is_none());
 

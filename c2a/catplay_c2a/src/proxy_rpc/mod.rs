@@ -23,3 +23,8 @@ pub use mirror_bridge::*;
 mod mirror_rx;
 #[cfg(feature = "experimental_airplay_mirroring")]
 pub use mirror_rx::*;
+
+#[cfg(feature = "experimental_airplay_mirroring")]
+mod mirror_audio;
+#[cfg(feature = "experimental_airplay_mirroring")]
+pub use mirror_audio::*;

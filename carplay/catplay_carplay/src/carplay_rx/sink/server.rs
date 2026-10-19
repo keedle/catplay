@@ -99,13 +99,18 @@ impl AirPlayServer {
     }
 
     fn advertisement_names(&self) -> (String, String) {
-        if self.profile.is_picture_only() {
+        if self.profile.is_experimental_mirroring() {
             let suffix = self
                 .mac_addr
                 .to_string()
                 .replace(':', "")
                 .to_ascii_lowercase();
-            return (format!("catplay-mirror-{suffix}.local."), format!("CatPlay Mirror Probe {suffix}"));
+            let instance = if self.profile.is_picture_only() {
+                format!("CatPlay Mirror Probe {suffix}")
+            } else {
+                format!("CatPlay AirPlay Mirror {suffix}")
+            };
+            return (format!("catplay-mirror-{suffix}.local."), instance);
         }
         ("carplay.local.".into(), "carplay".into())
     }
@@ -198,16 +203,18 @@ mod tests {
     #[cfg(feature = "experimental_airplay_mirroring")]
     #[test]
     fn experimental_discovery_is_distinct_and_never_invites() {
-        let mut mirror = server(AirPlayReceiverProfile::AppleTVH264VideoOnly);
-        assert_eq!(
-            mirror.advertisement_names(),
-            (
-                "catplay-mirror-020000000001.local.".into(),
-                "CatPlay Mirror Probe 020000000001".into()
-            )
-        );
-        assert!(!mirror.start_inviting());
-        assert!(mirror.inviter.is_none());
+        for (profile, expected_instance) in [
+            (AirPlayReceiverProfile::AppleTVH264VideoOnly, "CatPlay Mirror Probe 020000000001"),
+            (AirPlayReceiverProfile::AppleTVH264Mirroring, "CatPlay AirPlay Mirror 020000000001"),
+        ] {
+            let mut mirror = server(profile);
+            assert_eq!(
+                mirror.advertisement_names(),
+                ("catplay-mirror-020000000001.local.".into(), expected_instance.into())
+            );
+            assert!(!mirror.start_inviting());
+            assert!(mirror.inviter.is_none());
+        }
     }
 
     #[tokio::test]

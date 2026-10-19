@@ -1,6 +1,6 @@
 # AirPlay mirroring development result
 
-Decision: pursue a constrained H.264 compressed-stream path first. Transcoding has not been shown necessary for this phone and car. The current change includes a host policy prototype, a feature-gated Linux receiver probe, and an opt-in integrated car-video path awaiting full application validation. It is not installed adapter firmware or verified end-to-end mirroring.
+Decision: pursue a constrained H.264 compressed-stream path first. Transcoding has not been shown necessary for this phone and car. The current change includes a host policy prototype, a feature-gated Linux receiver probe, and an opt-in integrated car-video path with a successful Linux application build. Screen-plus-audio and recovery changes are now under review. It is not installed adapter firmware or verified end-to-end mirroring.
 
 The target is the user's working Carlinkit Mini Ultra 1, `clk-mini-ultra-nor`, confirmed Ingenic X1600 / AX1800M, paired with a Peugeot e208 GT EU and iPhone Air on iOS 27. A later read-only SSH check measured 55.4 MiB of Linux-visible RAM, about 36.2 MiB available while powered from the Mac, and the current 16 MiB NOR partition layout. The user reports firmware v0.17.0; its two release tags match our audited source baselines. No adapter configuration or software was changed. See the [device baseline](device-baseline.md).
 
@@ -11,7 +11,7 @@ The target is the user's working Carlinkit Mini Ultra 1, `clk-mini-ultra-nor`, c
 - A feature-gated picture-only receiver profile and bounded metadata probe, plus shared session-admission, cleanup and keyframe fixes.
 - A source audit, architecture decision, integration sequence and reproducible host commands.
 
-CarPlay remains the default. A feature-enabled application now offers a separate explicit process startup mode for experimental picture-only mirroring; see [integrated mode](integrated-mode.md). Shared receiver lifecycle and keyframe fixes intentionally affect the default code path too; physical CarPlay regression testing remains outstanding. Firmware recipes and installed service settings are unchanged. There is no dashboard mode switch. The experimental launch options select mirroring for the process lifetime; returning to normal CarPlay requires a fresh normal application session. Resuming CarPlay requires a fresh session. No same-iPhone dual session, Dashboard window, remote touch or compositor is implied.
+CarPlay remains the default. A feature-enabled application now offers a separate explicit process startup mode for experimental screen and media-audio mirroring; see [integrated mode](integrated-mode.md). Shared receiver lifecycle and keyframe fixes intentionally affect the default code path too; physical CarPlay regression testing remains outstanding. Firmware recipes and installed service settings are unchanged. There is no dashboard mode switch. The experimental launch options select mirroring for the process lifetime; returning to normal CarPlay requires a fresh normal application session. No same-iPhone dual session, Dashboard window, remote touch or compositor is implied.
 
 ## Host experiment evidence
 
@@ -37,7 +37,7 @@ Astra made the architecture decision and independently reviewed source/tests. So
 
 ## What prevents a production switch
 
-The source audit identified publication before admission, unguarded disconnect callbacks, CarPlay metadata overwriting the receiver identity, and assumptions about CarPlay events/keyframe control. The continuation repairs admission/cleanup, makes disconnect callbacks idempotent, and isolates the experimental profile metadata. The integrated source now connects the bounded picture bridge to the car-facing transmitter with separate ownership and control handling. Full Linux application compilation and physical validation remain pending. The AppleTV path also needs verification of iOS 27 setup/timing behavior and a deliberate audio policy. These findings are code-backed; no trace currently establishes the phone's negotiated stream or the Peugeot decoder's limits.
+The source audit identified publication before admission, unguarded disconnect callbacks, CarPlay metadata overwriting the receiver identity, and assumptions about CarPlay events/keyframe control. The continuation repairs admission/cleanup, makes disconnect callbacks idempotent, and isolates the experimental profile metadata. The integrated source now connects the bounded picture bridge to the car-facing transmitter with separate ownership and control handling. The earlier integrated video-only application passed Linux compilation and tests in both modes at `ffb8fcf3e0c293e407e18094483b40713e679469`. New audio and recovery integration requires a fresh validation run. Physical iOS 27 negotiation, decoder acceptance and playback remain unverified. These findings are code-backed; no trace currently establishes the phone's negotiated stream or the Peugeot decoder's limits.
 
 The next observation must identify the selected codec, coded dimensions/profile/level/cropping/rotation, initial versus later SETUP, timing mode and requested audio stream type using generated content. Until a trace and car capabilities are available, declaring a profile flip compatible would be speculation. See the architecture document for the precise integration prerequisites and later reversible test procedure.
 
@@ -50,3 +50,18 @@ Internet access during mirroring also remains unverified. A later test must dist
 Two Luna implementation workers completed receiver startup and a bounded video bridge under Sol supervision. Root and a fresh Astra reviewed integration, including real Annex B conversion, stale-session cleanup, car-screen ownership and unsupported recovery. New tests cover actual transmitter queueing and the two-frame outgoing cap. The updated CI builds the complete application with both default and experimental features. Source review and test definitions are not passing CI or vehicle-playback evidence.
 
 The original MIPS probe attempt reached native compiler dependencies but hit its 120-minute limit before compiling the probe. No target binary was produced. Cache and time-budget repairs are separate from this application integration.
+
+## Screen and audio continuation
+
+The current work reuses the contributor's FairPlay receiver, audio decoders, PCM
+bridge, car transmitter and firmware-managed access point. A combined H264/audio
+profile adds exact live-car PCM format matching, audio stream ownership and
+bounded video recovery. See [integrated mode](integrated-mode.md) for limits and
+acceptance tests. Fully functional AirPlay has not yet been demonstrated on the
+phone or adapter.
+
+The next MIPS target builds only the integrated application and its native
+dependencies. It retains the shipping MIPS ABI, musl time64 settings and pinned
+layers. Bounded compiler task caching is implemented; cache hits and build-time
+savings remain to be measured. The existing diagnostic compile remains separate
+and is not restarted for application-only source changes.

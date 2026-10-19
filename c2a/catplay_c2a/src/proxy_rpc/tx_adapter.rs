@@ -21,6 +21,19 @@ pub struct TxAdapter {
 
 pub enum TxAdapterOp {
     #[cfg(feature = "experimental_airplay_mirroring")]
+    MirrorSetupAudio {
+        id: super::MirrorSessionId,
+        attempt: super::MirrorAudioAttempt,
+        latency: Duration,
+        pcm_format: AudioStreamBasicDescription,
+        response: oneshot::Sender<RtspResult<AudioPlayerBox<i16>>>,
+    },
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    MirrorAudioEnded {
+        id: super::MirrorSessionId,
+        attempt: super::MirrorAudioAttempt,
+    },
+    #[cfg(feature = "experimental_airplay_mirroring")]
     MirrorConnected {
         id: super::MirrorSessionId,
         handle: AirPlayReceiverHandleRef,

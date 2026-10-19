@@ -21,15 +21,26 @@ mod production_mirror_bridge;
 #[path = "../../../c2a/catplay_c2a/src/proxy_rpc/mirror_rx.rs"]
 mod production_mirror_rx;
 #[cfg(feature = "experimental_airplay_mirroring")]
-use production_mirror_bridge::MirrorBridgeReceiver;
+use production_mirror_bridge::*;
 #[cfg(feature = "experimental_airplay_mirroring")]
 use production_mirror_rx::MirrorSessionId;
+#[cfg(feature = "experimental_airplay_mirroring")]
+#[path = "../../../c2a/catplay_c2a/src/proxy_rpc/mirror_audio.rs"]
+mod production_mirror_audio;
+#[cfg(feature = "experimental_airplay_mirroring")]
+use production_adapter::TxAdapterOp;
+#[cfg(feature = "experimental_airplay_mirroring")]
+use production_mirror_audio::*;
 
 mod proxy_rpc {
     #[cfg(feature = "experimental_airplay_mirroring")]
     pub use crate::production_adapter::TxAdapterOp;
     #[cfg(feature = "experimental_airplay_mirroring")]
+    pub use crate::production_mirror_audio::*;
+    #[cfg(feature = "experimental_airplay_mirroring")]
     pub use crate::production_mirror_bridge::*;
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub use crate::production_mirror_rx::MirrorSessionId;
     pub use crate::production_screen::ScreenProxyOp;
     pub mod proxy_screen {
         pub use crate::production_screen::*;

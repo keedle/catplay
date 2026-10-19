@@ -47,6 +47,24 @@ impl ScreenTransmitProxy {
             needs_keyframe: true,
         }
     }
+
+    /// Drop queued media and require an IDR before the next frame is sent.
+    /// Used by the experimental mirror path after a gap or stream change.
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn reset_for_keyframe(&mut self) {
+        if *self.closed.lock().unwrap() {
+            return;
+        }
+
+        let mut ops = self.queue.lock().unwrap();
+        ops.retain(ScreenTransmitOp::is_shutdown);
+        self.last_config = None;
+        self.needs_keyframe = true;
+        drop(ops);
+
+        self.notify_frame_added.notify();
+        self.notify_frame_consumed.notify();
+    }
 }
 
 impl ScreenTransmitSink for ScreenTransmitProxy {
@@ -146,5 +164,104 @@ impl Drop for ScreenTransmitProxy {
         debug!("Screen transmitter was dropped!");
         // self.queue.lock().unwrap().push_back(ScreenTransmitOp::TransmitterDropped);
         self.notify_frame_added.notify();
+    }
+}
+
+#[cfg(all(test, feature = "experimental_airplay_mirroring"))]
+mod tests {
+    use super::*;
+    use crate::video::{AvccConfig, Pts};
+    use std::time::Instant;
+
+    fn config(latency: Duration) -> AvccConfigExtended {
+        AvccConfigExtended {
+            hevc: false,
+            avcc: AvccConfig {
+                nal_size_len: 4,
+                sps_pps: vec![0, 0, 0, 1, 0x67, 66, 0, 30, 0, 0, 0, 1, 0x68, 0],
+            },
+            video_latency: latency,
+            width: 800,
+            height: 480,
+            respect_timestamps: true,
+        }
+    }
+
+    fn frame(is_keyframe: bool, config: Option<AvccConfigExtended>) -> EncodedVideoFrame {
+        EncodedVideoFrame {
+            pts: Pts(Instant::now()),
+            width: 800,
+            height: 480,
+            data: bytes::BytesMut::from(&b"frame"[..]),
+            config,
+            nal_offsets: None,
+            is_keyframe: Some(is_keyframe),
+            header_buf: bytes::BytesMut::new(),
+            chacha_tag_buf: bytes::BytesMut::new(),
+        }
+    }
+
+    fn proxy() -> (ScreenTransmitProxy, Arc<Mutex<VecDeque<ScreenTransmitOp>>>) {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let proxy = ScreenTransmitProxy::new(
+            Duration::ZERO,
+            queue.clone(),
+            Arc::new(Mutex::new(false)),
+            Notify::new(),
+            Notify::new(),
+            4,
+        );
+        (proxy, queue)
+    }
+
+    #[tokio::test]
+    async fn reset_drops_queued_media_and_requires_configured_idr() {
+        let mut proxy = proxy().0;
+        let old_config = config(Duration::ZERO);
+        proxy
+            .push_frame(frame(true, Some(old_config.clone())))
+            .await
+            .unwrap();
+        proxy.push_frame(frame(false, None)).await.unwrap();
+        assert_eq!(proxy.queue_len(), 2);
+        assert!(!proxy.needs_keyframe());
+
+        proxy.reset_for_keyframe();
+        assert_eq!(proxy.queue_len(), 0);
+        assert!(proxy.needs_keyframe());
+        assert!(proxy.last_config.is_none());
+        assert!(matches!(
+            proxy.push_frame(frame(false, None)).await,
+            Err((ScreenTransmitError::NotConfigured, _))
+        ));
+
+        let new_config = config(Duration::from_millis(20));
+        proxy
+            .push_frame(frame(true, Some(new_config)))
+            .await
+            .unwrap();
+        let queue = proxy.queue.lock().unwrap();
+        assert!(matches!(queue.front(), Some(ScreenTransmitOp::Configure(_))));
+        assert!(matches!(queue.get(1), Some(ScreenTransmitOp::Frame(_))));
+        assert_eq!(queue.len(), 2);
+        assert!(!proxy.needs_keyframe());
+    }
+
+    #[test]
+    fn reset_preserves_transmitter_shutdown_markers() {
+        let (mut proxy, queue) = proxy();
+        proxy.push_avcc_config(config(Duration::ZERO)).unwrap();
+        queue
+            .lock()
+            .unwrap()
+            .push_back(ScreenTransmitOp::TransmitterDropped);
+
+        proxy.reset_for_keyframe();
+
+        let ops = queue.lock().unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(ops.front(), Some(ScreenTransmitOp::TransmitterDropped)));
+        assert!(proxy.needs_keyframe());
+        assert!(proxy.last_config.is_none());
     }
 }

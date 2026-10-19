@@ -120,8 +120,47 @@ impl ModesArbiter {
     #[cfg(feature = "experimental_airplay_mirroring")]
     pub fn release_mirror_screen(&mut self) {
         let old = self.modes.screen;
-        self.modes.screen = ResourceManager::accessory_owned(old.take_constraint(), old.borrow_constraint());
-        self.modes_dirty = true;
+        if old.entity() == EntityEnum::Controller {
+            self.modes.screen = ResourceManager::accessory_owned(old.take_constraint(), old.borrow_constraint());
+            self.modes_dirty = true;
+        }
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn take_mirror_audio(&mut self) -> bool {
+        let audio = &mut self.modes.main_audio;
+        let take = Resource::take(
+            ResourceID::MainAudio,
+            ResourceTransferPriority::UserInitiated,
+            ResourceConstraint::Anytime,
+            ResourceConstraint::Anytime,
+        );
+        let accepted = audio.take_by_controller(&take)
+            || audio.borrow_by_controller(&Resource::borrow(
+                ResourceID::MainAudio,
+                ResourceTransferPriority::UserInitiated,
+                ResourceConstraint::Anytime,
+            ));
+        if accepted {
+            self.modes_dirty = true;
+        }
+        accepted
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn has_mirror_audio(&self) -> bool {
+        self.modes.main_audio.entity() == EntityEnum::Controller
+    }
+
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub fn release_mirror_audio(&mut self) {
+        let current = self.modes.main_audio;
+        if current.entity() == EntityEnum::Controller {
+            // Use current constraints, never restore a stale /info snapshot over
+            // a later car arbitration decision.
+            self.modes.main_audio = ResourceManager::accessory_owned(current.take_constraint(), current.borrow_constraint());
+            self.modes_dirty = true;
+        }
     }
 
     pub fn has_screen(&self) -> bool {
@@ -405,6 +444,32 @@ mod tests {
 #[cfg(all(test, feature = "experimental_airplay_mirroring"))]
 mod mirror_mode_tests {
     use super::*;
+    #[test]
+    fn mirror_audio_obeys_car_constraints_and_release_preserves_current_constraints() {
+        let mut arbiter = ModesArbiter::new(&ChangeModes::initial());
+        arbiter.modes.main_audio = ResourceManager::accessory_owned(ResourceConstraint::Never, ResourceConstraint::Never);
+        assert!(!arbiter.take_mirror_audio());
+        assert!(!arbiter.has_mirror_audio());
+        arbiter.modes.main_audio = ResourceManager::accessory_owned(ResourceConstraint::Anytime, ResourceConstraint::Anytime);
+        assert!(arbiter.take_mirror_audio());
+        assert!(arbiter.has_mirror_audio());
+        arbiter.modes.main_audio = ResourceManager::new(
+            ResourceState::ControllerHas,
+            ResourceConstraint::UserInitiated,
+            ResourceConstraint::Never,
+        );
+        arbiter.release_mirror_audio();
+        assert!(!arbiter.has_mirror_audio());
+        assert_eq!(arbiter.modes.main_audio.take_constraint(), ResourceConstraint::UserInitiated);
+        assert_eq!(arbiter.modes.main_audio.borrow_constraint(), ResourceConstraint::Never);
+        arbiter.clear_dirty();
+        arbiter.release_mirror_audio();
+        arbiter.release_mirror_screen();
+        arbiter.clear_dirty();
+        arbiter.release_mirror_screen();
+        assert!(!arbiter.modes_dirty());
+    }
+
     #[test]
     fn idle_and_disconnected_mirror_release_screen_without_taking_audio() {
         let mut arbiter = ModesArbiter::new(&ChangeModes::initial());

@@ -5,10 +5,10 @@
 
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -22,6 +22,7 @@ use catplay_util::{AsyncShutdown, EventSleeper, EventToken};
 use tokio::sync::Notify;
 
 const PUBLISH_TIMEOUT: Duration = Duration::from_millis(500);
+pub const MIRROR_IDR_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 static NEXT_GENERATION: AtomicUsize = AtomicUsize::new(1);
 const MAX_ACCESS_UNIT_NALS: usize = 4096;
 
@@ -76,6 +77,10 @@ impl MirrorBridge {
             pending_revision: 0,
             revision: 0,
             needs_idr: true,
+            idr_wait: Some(IdrWait {
+                kind: MirrorIdrWaitState::WaitingInitialIdr,
+                deadline: Instant::now() + MIRROR_IDR_WAIT_TIMEOUT,
+            }),
         }));
         let producer_notify = Arc::new(Notify::new());
         let consumer_notify = Arc::new(Notify::new());
@@ -103,6 +108,20 @@ struct BridgeState {
     pending_revision: usize,
     revision: usize,
     needs_idr: bool,
+    idr_wait: Option<IdrWait>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorIdrWaitState {
+    WaitingInitialIdr,
+    Streaming,
+    WaitingRecoveryIdr,
+    Closed,
+}
+
+struct IdrWait {
+    kind: MirrorIdrWaitState,
+    deadline: Instant,
 }
 
 /// AirPlay screen sink that validates each access unit and retains at most one
@@ -120,9 +139,51 @@ pub struct MirrorBridgeReceiver {
     consumer_notify: Arc<Notify>,
 }
 
+/// Weak liveness/status handle retained by the AirPlay session. It does not
+/// keep a closed screen bridge or its queue alive.
+#[derive(Clone)]
+pub struct MirrorStreamStatus {
+    state: Weak<Mutex<BridgeState>>,
+}
+
+impl MirrorStreamStatus {
+    pub fn is_closed(&self) -> bool {
+        self.state
+            .upgrade()
+            .is_none_or(|state| state.lock().unwrap().closed)
+    }
+
+    pub fn idr_wait_state(&self) -> MirrorIdrWaitState {
+        let Some(state) = self.state.upgrade() else {
+            return MirrorIdrWaitState::Closed;
+        };
+        idr_wait_state(&state.lock().unwrap())
+    }
+}
+
 impl MirrorBridgeReceiver {
     pub fn generation(&self) -> usize {
         self.state.lock().unwrap().generation
+    }
+
+    pub fn stream_status(&self) -> MirrorStreamStatus {
+        MirrorStreamStatus {
+            state: Arc::downgrade(&self.state),
+        }
+    }
+
+    pub fn idr_wait_state(&self) -> MirrorIdrWaitState {
+        idr_wait_state(&self.state.lock().unwrap())
+    }
+
+    /// True after the initial or recovery IDR deadline expires.
+    pub fn recovery_expired(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.needs_idr
+            && state
+                .idr_wait
+                .as_ref()
+                .is_some_and(|wait| Instant::now() >= wait.deadline)
     }
 
     /// Take the pending frame without waiting. The frame includes the accepted
@@ -137,6 +198,10 @@ impl MirrorBridgeReceiver {
         let mut state = self.state.lock().unwrap();
         let frame = state.pending.take();
         if let Some(frame) = frame {
+            if frame.is_known_keyframe() && frame.config.is_some() {
+                state.needs_idr = false;
+                state.idr_wait = None;
+            }
             self.producer_notify.notify_one();
             return Some((state.pending_revision, frame));
         }
@@ -155,9 +220,20 @@ impl MirrorBridgeReceiver {
     /// Discard queued media and require a fresh IDR after downstream loss.
     pub fn invalidate_until_idr(&mut self) {
         let mut state = self.state.lock().unwrap();
-        state.pending.take();
-        state.needs_idr = true;
+        if state.closed {
+            return;
+        }
+        require_idr(&mut state);
         advance_revision(&mut state);
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|frame| frame.is_known_keyframe() && frame.config.is_some())
+        {
+            state.pending_revision = state.revision;
+        } else {
+            state.pending.take();
+        }
         self.producer_notify.notify_one();
         self.consumer_notify.notify_one();
     }
@@ -169,6 +245,7 @@ impl MirrorBridgeReceiver {
         state.pending.take();
         state.config.take();
         advance_revision(&mut state);
+        state.idr_wait = None;
         self.producer_notify.notify_one();
         self.consumer_notify.notify_one();
     }
@@ -189,6 +266,7 @@ impl Drop for MirrorBridgeReceiver {
         state.pending.take();
         state.config.take();
         advance_revision(&mut state);
+        state.idr_wait = None;
         self.producer_notify.notify_one();
         self.consumer_notify.notify_one();
     }
@@ -210,7 +288,7 @@ impl ScreenReceiverSink for MirrorBridgeSink {
             // not leave the previous stream usable.
             state.pending.take();
             state.config.take();
-            state.needs_idr = true;
+            require_idr(&mut state);
             advance_revision(&mut state);
             self.producer_notify.notify_one();
             self.consumer_notify.notify_one();
@@ -225,7 +303,7 @@ impl ScreenReceiverSink for MirrorBridgeSink {
             return Err(closed_error());
         }
         state.config = Some(config);
-        state.needs_idr = true;
+        require_idr(&mut state);
         advance_revision(&mut state);
         self.consumer_notify.notify_one();
         Ok(())
@@ -247,6 +325,14 @@ impl ScreenReceiverSink for MirrorBridgeSink {
             {
                 return Err(RtspError::ProtocolViolation("mirror frame config changed without reconfiguration"));
             }
+            if state.needs_idr
+                && state
+                    .idr_wait
+                    .as_ref()
+                    .is_some_and(|wait| Instant::now() >= wait.deadline)
+            {
+                return Err(RtspError::ProtocolViolation("timed out waiting for mirror IDR"));
+            }
             (state.limits, state.needs_idr, state.revision)
         };
         if frame.width != limits.width || frame.height != limits.height || frame.data.len() > limits.max_frame_bytes {
@@ -254,7 +340,7 @@ impl ScreenReceiverSink for MirrorBridgeSink {
         }
         let is_idr = validate_access_unit(&frame.data)?;
         if needs_idr && !is_idr {
-            return Err(RtspError::ProtocolViolation("mirror stream must begin with a validated IDR"));
+            return Ok(());
         }
 
         // Only IDRs carry config to the transmitter. Source-provided NAL offset
@@ -292,20 +378,19 @@ impl ScreenReceiverSink for MirrorBridgeSink {
                     return Err(closed_error());
                 }
                 if state.revision != accepted_revision {
-                    return Err(RtspError::ProtocolViolation("stale mirror generation revision"));
+                    return Ok(());
                 }
                 if is_idr && state.config.as_ref() != frame.config.as_ref() {
                     return Err(RtspError::ProtocolViolation("stale mirror generation config"));
                 }
                 if state.needs_idr && !is_idr {
-                    return Err(RtspError::ProtocolViolation(
-                        "mirror bridge was invalidated and requires a fresh IDR",
-                    ));
+                    return Ok(());
                 }
                 if state.pending.is_none() {
                     state.pending = Some(frame);
                     state.pending_revision = state.revision;
                     state.needs_idr = false;
+                    state.idr_wait = None;
                     self.consumer_notify.notify_one();
                     return Ok(());
                 }
@@ -314,7 +399,19 @@ impl ScreenReceiverSink for MirrorBridgeSink {
                 .await
                 .is_err()
             {
-                return Err(RtspError::ProtocolViolation("mirror consumer did not drain the bounded frame slot"));
+                let mut state = self.state.lock().unwrap();
+                if state.closed {
+                    return Err(closed_error());
+                }
+                if state.revision != accepted_revision {
+                    return Ok(());
+                }
+                require_idr(&mut state);
+                state.pending.take();
+                advance_revision(&mut state);
+                self.producer_notify.notify_one();
+                self.consumer_notify.notify_one();
+                return Ok(());
             }
         }
     }
@@ -337,6 +434,7 @@ impl AsyncShutdown for MirrorBridgeSink {
         state.pending.take();
         state.config.take();
         advance_revision(&mut state);
+        state.idr_wait = None;
         self.producer_notify.notify_one();
         self.consumer_notify.notify_one();
     }
@@ -349,6 +447,7 @@ impl Drop for MirrorBridgeSink {
         state.pending.take();
         state.config.take();
         advance_revision(&mut state);
+        state.idr_wait = None;
         self.producer_notify.notify_one();
         self.consumer_notify.notify_one();
     }
@@ -371,6 +470,38 @@ impl EventSleeper for MirrorBridgeReceiver {
 
 fn closed_error() -> RtspError {
     RtspError::ProtocolViolation("mirror bridge generation is closed")
+}
+
+fn require_idr(state: &mut BridgeState) {
+    if state.idr_wait.is_some() {
+        return;
+    }
+    let kind = if state.needs_idr {
+        MirrorIdrWaitState::WaitingInitialIdr
+    } else {
+        MirrorIdrWaitState::WaitingRecoveryIdr
+    };
+    state.needs_idr = true;
+    state.idr_wait = Some(IdrWait {
+        kind,
+        deadline: Instant::now() + MIRROR_IDR_WAIT_TIMEOUT,
+    });
+}
+
+fn idr_wait_state(state: &BridgeState) -> MirrorIdrWaitState {
+    if state.closed {
+        MirrorIdrWaitState::Closed
+    } else {
+        state
+            .idr_wait
+            .as_ref()
+            .map(|wait| wait.kind)
+            .unwrap_or(if state.needs_idr {
+                MirrorIdrWaitState::WaitingInitialIdr
+            } else {
+                MirrorIdrWaitState::Streaming
+            })
+    }
 }
 
 fn validate_config(config: &AvccConfigExtended, limits: MirrorLimits) -> RtspResult<()> {
@@ -499,10 +630,14 @@ mod tests {
     use super::*;
     use catplay_carplay::{
         clock::{MediaClock, NtpU64},
-        screen::ScreenFrame,
+        screen::{
+            ScreenFrame,
+            tx::{ScreenTransmitOp, ScreenTransmitProxy},
+        },
         video::{AvccConfig, Pts},
     };
-    use std::time::Instant;
+    use catplay_util::notify::Notify;
+    use std::{collections::VecDeque, time::Instant};
 
     struct Clock(Instant);
     impl MediaClock for Clock {
@@ -564,7 +699,9 @@ mod tests {
     async fn forwards_only_validated_idr_and_attaches_config() {
         let (mut sink, mut receiver) = MirrorBridge::new(limits());
         sink.set_avcc_config(config()).await.unwrap();
-        assert!(sink.process_frame(frame(&[&[0x41, 1]])).await.is_err());
+        sink.process_frame(frame(&[&[0x41, 1]])).await.unwrap();
+        assert!(receiver.take_frame().is_none());
+        assert_eq!(receiver.idr_wait_state(), MirrorIdrWaitState::WaitingInitialIdr);
         sink.process_frame(frame(&[&[0x09, 0xf0], &[0x06, 0x80], &[0x65, 0x80]]))
             .await
             .unwrap();
@@ -585,7 +722,8 @@ mod tests {
         };
         sink.set_avcc_config(changed.clone()).await.unwrap();
         assert!(receiver.take_frame().is_none());
-        assert!(sink.process_frame(frame(&[&[0x41, 0x80]])).await.is_err());
+        sink.process_frame(frame(&[&[0x41, 0x80]])).await.unwrap();
+        assert!(receiver.take_frame().is_none());
         let mut fresh = frame(&[&[0x65, 0x80]]);
         fresh.config = Some(changed.clone());
         sink.process_frame(fresh).await.unwrap();
@@ -631,6 +769,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decoded_screen_recovers_through_bridge_and_transmitter_on_natural_idr() {
+        let config = config();
+        let (mut sink, mut receiver) = MirrorBridge::new(limits());
+        sink.set_avcc_config(config.clone()).await.unwrap();
+        let clock = Clock(Instant::now());
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut tx = ScreenTransmitProxy::new(
+            Duration::ZERO,
+            queue.clone(),
+            Arc::new(Mutex::new(false)),
+            Notify::new(),
+            Notify::new(),
+            4,
+        );
+        let decode = |nal: &[u8]| {
+            let mut avcc = BytesMut::new();
+            avcc.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            avcc.extend_from_slice(nal);
+            ScreenFrame::video_avcc(avcc, clock.0, &clock)
+                .video_decode(&config, &clock)
+                .unwrap()
+                .unwrap()
+        };
+
+        sink.process_frame(decode(&[0x65, 0x80])).await.unwrap();
+        tx.push_frame(receiver.take_frame().unwrap()).await.unwrap();
+        tx.reset_for_keyframe();
+        receiver.invalidate_until_idr();
+        assert!(queue.lock().unwrap().is_empty());
+
+        sink.process_frame(decode(&[0x41, 0x80])).await.unwrap();
+        assert!(receiver.take_frame().is_none());
+        assert_eq!(tx.queue_len(), 0);
+        assert!(tx.needs_keyframe());
+
+        sink.process_frame(decode(&[0x65, 0x80])).await.unwrap();
+        tx.push_frame(receiver.take_frame().unwrap()).await.unwrap();
+        let ops = queue.lock().unwrap();
+        assert!(matches!(ops.front(), Some(ScreenTransmitOp::Configure(_))));
+        assert!(matches!(ops.get(1), Some(ScreenTransmitOp::Frame(frame)) if frame.is_known_keyframe()));
+        assert_eq!(ops.len(), 2);
+    }
+
+    #[tokio::test]
     async fn closing_generation_rejects_late_producer_callbacks() {
         let (mut sink, mut receiver) = MirrorBridge::new(limits());
         sink.set_avcc_config(config()).await.unwrap();
@@ -649,5 +831,127 @@ mod tests {
         assert!(sink.set_avcc_config(invalid).await.is_err());
         assert!(!receiver.is_revision_current(revision));
         assert!(sink.process_frame(frame(&[&[0x65, 0x80]])).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn initial_idr_wait_drops_deltas_and_repeated_config_does_not_extend_deadline() {
+        let (mut sink, mut receiver) = MirrorBridge::new(limits());
+        let deadline = receiver
+            .state
+            .lock()
+            .unwrap()
+            .idr_wait
+            .as_ref()
+            .unwrap()
+            .deadline;
+        sink.set_avcc_config(config()).await.unwrap();
+        for _ in 0..3 {
+            sink.process_frame(frame(&[&[0x41, 0x80]])).await.unwrap();
+        }
+        let changed_latency = AvccConfigExtended {
+            video_latency: Duration::from_millis(20),
+            ..config()
+        };
+        sink.set_avcc_config(changed_latency).await.unwrap();
+        assert_eq!(
+            receiver
+                .state
+                .lock()
+                .unwrap()
+                .idr_wait
+                .as_ref()
+                .unwrap()
+                .deadline,
+            deadline
+        );
+        assert_eq!(receiver.idr_wait_state(), MirrorIdrWaitState::WaitingInitialIdr);
+        assert!(receiver.take_frame().is_none());
+    }
+
+    #[test]
+    fn initial_idr_deadline_expires_even_before_config_or_frames() {
+        let (_sink, receiver) = MirrorBridge::new(limits());
+        assert_eq!(receiver.idr_wait_state(), MirrorIdrWaitState::WaitingInitialIdr);
+        assert!(!receiver.recovery_expired());
+        receiver
+            .state
+            .lock()
+            .unwrap()
+            .idr_wait
+            .as_mut()
+            .unwrap()
+            .deadline = Instant::now() - Duration::from_millis(1);
+        assert!(receiver.recovery_expired());
+    }
+
+    #[tokio::test]
+    async fn recovery_deadline_starts_once_and_expires_without_new_frames() {
+        let (mut sink, mut receiver) = MirrorBridge::new(limits());
+        sink.set_avcc_config(config()).await.unwrap();
+        sink.process_frame(frame(&[&[0x65, 0x80]])).await.unwrap();
+        receiver.take_frame().unwrap();
+        assert_eq!(receiver.idr_wait_state(), MirrorIdrWaitState::Streaming);
+
+        receiver.invalidate_until_idr();
+        let deadline = receiver
+            .state
+            .lock()
+            .unwrap()
+            .idr_wait
+            .as_ref()
+            .unwrap()
+            .deadline;
+        assert_eq!(receiver.idr_wait_state(), MirrorIdrWaitState::WaitingRecoveryIdr);
+        receiver.invalidate_until_idr();
+        sink.set_avcc_config(config()).await.unwrap();
+        assert_eq!(
+            receiver
+                .state
+                .lock()
+                .unwrap()
+                .idr_wait
+                .as_ref()
+                .unwrap()
+                .deadline,
+            deadline
+        );
+        assert!(!receiver.recovery_expired());
+
+        receiver
+            .state
+            .lock()
+            .unwrap()
+            .idr_wait
+            .as_mut()
+            .unwrap()
+            .deadline = Instant::now() - Duration::from_millis(1);
+        assert!(receiver.recovery_expired());
+        assert!(sink.process_frame(frame(&[&[0x41, 0x80]])).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn invalidation_keeps_pending_configured_idr_and_revisions_it() {
+        let (mut sink, mut receiver) = MirrorBridge::new(limits());
+        sink.set_avcc_config(config()).await.unwrap();
+        sink.process_frame(frame(&[&[0x65, 0x80]])).await.unwrap();
+        let previous_revision = receiver.revision();
+        receiver.invalidate_until_idr();
+        let (revision, idr) = receiver.take_frame_tagged().unwrap();
+        assert!(revision > previous_revision);
+        assert_eq!(idr.config, Some(config()));
+        assert_eq!(receiver.idr_wait_state(), MirrorIdrWaitState::Streaming);
+    }
+
+    #[tokio::test]
+    async fn weak_status_reports_sink_shutdown_and_does_not_keep_state_alive() {
+        let (mut sink, receiver) = MirrorBridge::new(limits());
+        let status = receiver.stream_status();
+        assert!(!status.is_closed());
+        sink.shutdown().await;
+        assert!(status.is_closed());
+        assert_eq!(status.idr_wait_state(), MirrorIdrWaitState::Closed);
+        drop(receiver);
+        drop(sink);
+        assert!(status.is_closed());
     }
 }

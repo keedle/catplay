@@ -13,9 +13,41 @@ use crate::proxy::pcm_proxy::PcmProxyPlayer;
 pub struct AudioProxyUtil;
 
 impl AudioProxyUtil {
+    /// Open a one-way mirrored audio stream using the existing car media path.
+    /// The AirPlay receiver has already decoded this PCM format; unsupported
+    /// car formats are rejected by the caller before this method is invoked.
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    pub async fn open_mirroring_audio(
+        car: AirPlayTransmitterProxyRef,
+        latency: Duration,
+        pcm_format: AudioStreamBasicDescription,
+    ) -> RtspResult<(AudioPlayerBox<i16>, Option<AudioRecorderBox<i16>>)> {
+        Self::open_audio(
+            car,
+            latency,
+            StreamType::MainAudio,
+            AudioType::Media,
+            AudioFormat::try_from(pcm_format).map_err(|_| RtspError::NotSupported)?,
+            pcm_format,
+            false,
+        )
+        .await
+    }
+
     pub async fn open_audio(
         car: AirPlayTransmitterProxyRef,
         _latency: Duration,
+        stream_type: StreamType,
+        audio_type: AudioType,
+        audio_format: AudioFormat,
+        pcm_format: AudioStreamBasicDescription,
+        duplex: bool,
+    ) -> RtspResult<(AudioPlayerBox<i16>, Option<AudioRecorderBox<i16>>)> {
+        Self::open_audio_inner(car, stream_type, audio_type, audio_format, pcm_format, duplex).await
+    }
+
+    async fn open_audio_inner(
+        car: AirPlayTransmitterProxyRef,
         mut stream_type: StreamType,
         audio_type: AudioType,
         audio_format: AudioFormat,

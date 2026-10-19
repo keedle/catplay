@@ -35,6 +35,8 @@ pub struct CarManager {
     mirror_peer: Option<(super::MirrorSessionId, AirPlayReceiverHandleRef)>,
     #[cfg(feature = "experimental_airplay_mirroring")]
     mirror_reset_pending: bool,
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    mirror_audio: Option<(super::MirrorSessionId, super::MirrorAudioAttempt)>,
     // TODO dont wrap the ref with TeardownGuard...
     car_state: TeardownGuard<AirPlayTransmitterProxyRef>,
     car_had_record: bool,
@@ -105,6 +107,8 @@ impl CarManager {
             mirror_peer: None,
             #[cfg(feature = "experimental_airplay_mirroring")]
             mirror_reset_pending: false,
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            mirror_audio: None,
             car_media_clock,
             car_had_record: false,
             iphone_peer: None,
@@ -278,6 +282,19 @@ impl CarManager {
                 self.mirror_reset_pending = false;
             }
         }
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        if self.mirror_audio.is_some() && !self.modes.has_mirror_audio() {
+            if let Some((_, attempt)) = self.mirror_audio.as_ref() {
+                attempt.retire();
+            }
+            if let Some((_, phone)) = self.mirror_peer.as_ref() {
+                phone.close(RtspError::UserClosing);
+            }
+        }
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        if self.mirror_mode && !self.overlay.has_mirror_screen() {
+            self.modes.release_mirror_screen();
+        }
         self.flush_modes();
 
         // Don't attempt to forcefully steal Screen if we have a peer and arbitration is active as that will be glitchy
@@ -314,7 +331,7 @@ impl CarManager {
         }
 
         #[cfg(feature = "experimental_airplay_mirroring")]
-        let source_ready = !self.mirror_mode || self.mirror_peer.is_some();
+        let source_ready = !self.mirror_mode || self.overlay.has_mirror_screen();
         #[cfg(not(feature = "experimental_airplay_mirroring"))]
         let source_ready = true;
         if source_ready && self.modes.has_screen() && !self.overlay.has_car_peer() && self.pending_screen_setup.is_none() {
@@ -343,10 +360,18 @@ impl CarManager {
                 }
                 .boxed(),
             );
-        } else if !self.modes.has_screen() && self.overlay.has_car_peer() && self.pending_screen_setup.is_none() {
+        } else if (!source_ready || !self.modes.has_screen()) && self.overlay.has_car_peer() && self.pending_screen_setup.is_none() {
             // Ensure screen is TEARDOWN
             info!("Scheduling screen TEARDOWN");
 
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            let screen = if self.mirror_mode && !source_ready {
+                self.overlay.retire_mirror_car_stream();
+                None
+            } else {
+                self.overlay.drop_car_peer()
+            };
+            #[cfg(not(feature = "experimental_airplay_mirroring"))]
             let screen = self.overlay.drop_car_peer();
             let tx = self.car_state.clone();
             let modes = self.modes.modes_mut().serialize_to_state();
@@ -372,6 +397,82 @@ impl CarManager {
     pub fn dispatch_tx_op(&mut self, op: TxAdapterOp) {
         match op {
             #[cfg(feature = "experimental_airplay_mirroring")]
+            TxAdapterOp::MirrorSetupAudio {
+                id,
+                attempt,
+                latency,
+                pcm_format,
+                response,
+            } => {
+                let owner = self
+                    .mirror_peer
+                    .as_ref()
+                    .is_some_and(|(active, _)| active.matches(&id));
+                let car_formats = super::mirror_car_pcm_formats(self.car_state.info_cached());
+                if !self.mirror_mode
+                    || !owner
+                    || !id.is_active()
+                    || !attempt.is_active()
+                    || self
+                        .mirror_audio
+                        .as_ref()
+                        .is_some_and(|(_, active)| active.is_active())
+                    || !super::mirror_pcm_supported(car_formats, pcm_format)
+                    || !self.modes.take_mirror_audio()
+                {
+                    attempt.retire();
+                    let _ = response.send(Err(RtspError::NotSupported));
+                    return;
+                }
+                self.mirror_audio = Some((id.clone(), attempt.clone()));
+                let modes = self.modes.modes_mut().serialize_to_state();
+                let car = self.car_state.clone();
+                self.tx_queue.push_back(
+                    async move {
+                        let result = super::complete_mirror_audio_setup(
+                            &id,
+                            &attempt,
+                            async {
+                                // Stream guards from a prior attempt must finish
+                                // TEARDOWN before replacement MainAudio SETUP.
+                                car.drain_teardown_queue().await?;
+                                if !id.is_active() || !attempt.is_active() {
+                                    return Err(RtspError::Closed);
+                                }
+                                car.assert_modes(modes).await?;
+                                if !id.is_active() || !attempt.is_active() {
+                                    return Err(RtspError::Closed);
+                                }
+                                let (player, _) = AudioProxyUtil::open_mirroring_audio(car.clone(), latency, pcm_format).await?;
+                                Ok(player)
+                            },
+                            || async { car.drain_teardown_queue().await },
+                        )
+                        .await;
+                        // On failure the RX callback emits tagged MirrorAudioEnded,
+                        // or its session Drop emits MirrorDisconnected. Both roll
+                        // ownership back through current car arbitration state.
+                        let _ = response.send(result);
+                        Ok(())
+                    }
+                    .boxed(),
+                );
+            }
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            TxAdapterOp::MirrorAudioEnded { id, attempt } => {
+                if self
+                    .mirror_audio
+                    .as_ref()
+                    .is_some_and(|(owner, active)| owner.matches(&id) && active.matches(&attempt))
+                {
+                    self.mirror_audio = None;
+                    self.modes.release_mirror_audio();
+                    let car = self.car_state.clone();
+                    self.tx_queue
+                        .push_back(async move { car.drain_teardown_queue().await }.boxed());
+                }
+            }
+            #[cfg(feature = "experimental_airplay_mirroring")]
             TxAdapterOp::MirrorConnected { id, handle } => {
                 if !self.mirror_mode || self.iphone_peer.is_some() || self.mirror_peer.is_some() {
                     handle.close(RtspError::NotSupported);
@@ -380,8 +481,6 @@ impl CarManager {
                 self.mirror_peer = Some((id, handle.clone()));
                 self.overlay.set_mirror_peer(Some(handle));
                 self.mirror_reset_pending = true;
-                self.modes
-                    .try_steal_screen(ResourceTransferPriority::UserInitiated);
             }
             #[cfg(feature = "experimental_airplay_mirroring")]
             TxAdapterOp::MirrorScreen { id, mut receiver } => {
@@ -391,6 +490,9 @@ impl CarManager {
                     .is_some_and(|(active, _)| active.matches(&id))
                 {
                     self.overlay.set_mirror_screen(receiver);
+                    self.mirror_reset_pending = true;
+                    self.modes
+                        .try_steal_screen(ResourceTransferPriority::UserInitiated);
                 } else {
                     receiver.close();
                 }
@@ -402,6 +504,11 @@ impl CarManager {
                     .as_ref()
                     .is_some_and(|(active, _)| active.matches(&id))
                 {
+                    id.retire();
+                    if let Some((_, attempt)) = self.mirror_audio.take() {
+                        attempt.retire();
+                    }
+                    self.modes.release_mirror_audio();
                     self.mirror_peer = None;
                     self.overlay.set_mirror_peer(None);
                     self.mirror_reset_pending = true;
@@ -587,9 +694,10 @@ impl CarManager {
             let mut cmd = cmd;
             match cmd.command() {
                 Command::ForceKeyFrame(_) => {
-                    // Mirroring has no evidenced keyframe request transport.
-                    self.overlay.fail_mirror_stream();
-                    cmd.respond_err();
+                    // Initiate bounded recovery using a natural IDR. This does
+                    // not claim any keyframe command was sent to the phone.
+                    self.overlay.recover_mirror_stream();
+                    cmd.respond_ok();
                 }
                 Command::ChangeModes(change) => {
                     let response = if self.mirror_peer.is_some() {

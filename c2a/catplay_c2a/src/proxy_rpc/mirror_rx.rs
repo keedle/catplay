@@ -1,4 +1,4 @@
-//! Picture-only receiver callbacks. Phone control/audio never enter CarPlay RPC.
+//! Mirroring callbacks reuse media paths while keeping phone controls separate.
 use crate::{
     MirroringOptions,
     proxy_rpc::{MirrorBridge, MirrorLimits, TxAdapterOp},
@@ -13,14 +13,26 @@ use catplay_carplay::{
     screen::rx::ScreenReceiverSinkBox,
 };
 use catplay_util::{AsyncShutdown, EventReconciler, EventSleeper, mpsc};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 /// A retained identity token cannot collide with an old or foreign session.
 #[derive(Clone, Debug)]
-pub struct MirrorSessionId(Arc<()>);
+pub struct MirrorSessionId(Arc<AtomicBool>);
 impl MirrorSessionId {
     pub fn new() -> Self {
-        Self(Arc::new(()))
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+    pub fn is_active(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+    pub fn retire(&self) {
+        self.0.store(false, Ordering::Release);
     }
     pub fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -34,7 +46,9 @@ pub struct MirrorRxSession {
     width: u32,
     height: u32,
     handle: Option<AirPlayReceiverHandleRef>,
-    opened_screen: bool,
+    screen_status: Option<super::MirrorStreamStatus>,
+    car_pcm_formats: catplay_carplay::msg::AudioFormat,
+    audio_attempt: Option<super::MirrorAudioAttempt>,
 }
 impl MirrorRxSession {
     pub fn new(car: mpsc::UnboundedSender<TxAdapterOp>, options: MirroringOptions, width: u32, height: u32) -> Self {
@@ -45,10 +59,20 @@ impl MirrorRxSession {
             width,
             height,
             handle: None,
-            opened_screen: false,
+            screen_status: None,
+            car_pcm_formats: catplay_carplay::msg::AudioFormat::empty(),
+            audio_attempt: None,
         }
     }
+    pub fn with_audio_formats(mut self, car_pcm_formats: catplay_carplay::msg::AudioFormat) -> Self {
+        self.car_pcm_formats = car_pcm_formats;
+        self
+    }
     fn finish(&mut self) {
+        self.id.retire();
+        if let Some(attempt) = self.audio_attempt.take() {
+            attempt.retire();
+        }
         if self.handle.take().is_some() {
             let _ = self
                 .car
@@ -83,6 +107,27 @@ impl AirPlayReceiverSink for MirrorRxSession {
         }
     }
     async fn on_info(&mut self, info: &mut InfoMessageResponse) {
+        use catplay_carplay::msg::{AudioFormatStruct, AudioLatency, AudioType, StreamType};
+        let formats = super::mirror_input_audio_formats(self.car_pcm_formats);
+        info.audio_formats.clear();
+        info.audio_latencies.clear();
+        if !formats.is_empty() {
+            for stream_type in [StreamType::GeneralAudio, StreamType::MainAudio, StreamType::MainHighAudio] {
+                info.audio_formats.push(AudioFormatStruct {
+                    stream_type,
+                    audio_type: Some(AudioType::Media),
+                    audio_input_formats: None,
+                    audio_output_formats: Some(formats),
+                });
+                info.audio_latencies.push(AudioLatency {
+                    stream_type: Some(stream_type),
+                    audio_type: Some(AudioType::Media),
+                    input_latency_micros: None,
+                    output_latency_micros: Some(32000),
+                    ..Default::default()
+                });
+            }
+        }
         info.displays = vec![Display {
             width_pixels: self.width,
             height_pixels: self.height,
@@ -95,7 +140,13 @@ impl AirPlayReceiverSink for MirrorRxSession {
         Err(RtspError::NotSupported)
     }
     async fn open_screen(&mut self, _latency: Duration) -> RtspResult<ScreenReceiverSinkBox> {
-        if self.handle.is_none() || self.car.is_closed() || self.opened_screen {
+        if self.handle.is_none()
+            || self.car.is_closed()
+            || self
+                .screen_status
+                .as_ref()
+                .is_some_and(|status| !status.is_closed())
+        {
             return Err(RtspError::NotSupported);
         }
         let limits = MirrorLimits::new(
@@ -106,16 +157,93 @@ impl AirPlayReceiverSink for MirrorRxSession {
             AIRPLAY_MIRRORING_MAX_SCREEN_PAYLOAD,
         )?;
         let (sink, receiver) = MirrorBridge::new(limits);
+        self.screen_status = Some(receiver.stream_status());
         self.car
             .unbounded_send(TxAdapterOp::MirrorScreen {
                 id: self.id.clone(),
                 receiver,
             })
             .map_err(|_| RtspError::Closed)?;
-        self.opened_screen = true;
         Ok(Box::new(sink))
     }
-    // Default open_audio/open_microphone/open_iap2 reject or return None.
+    async fn open_audio(
+        &mut self,
+        latency: Duration,
+        stream_type: catplay_carplay::msg::StreamType,
+        audio_type: catplay_carplay::msg::AudioType,
+        audio_format: catplay_carplay::msg::AudioFormat,
+        pcm_format: catplay_carplay::audio::AudioStreamBasicDescription,
+        duplex: bool,
+    ) -> RtspResult<catplay_carplay::audio::AudioPlayerBox<i16>> {
+        use catplay_carplay::msg::StreamType;
+        if self.handle.is_none()
+            || !self.id.is_active()
+            || self.car.is_closed()
+            || duplex
+            || !matches!(
+                audio_type,
+                catplay_carplay::msg::AudioType::Media | catplay_carplay::msg::AudioType::Default
+            )
+            || !matches!(
+                stream_type,
+                StreamType::GeneralAudio | StreamType::MainAudio | StreamType::MainHighAudio
+            )
+            || audio_format.bits().count_ones() != 1
+            || !super::mirror_input_audio_formats(self.car_pcm_formats).contains(audio_format)
+            || !super::mirror_pcm_supported(self.car_pcm_formats, pcm_format)
+            || self
+                .audio_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.is_active())
+        {
+            return Err(RtspError::NotSupported);
+        }
+        let attempt = super::MirrorAudioAttempt::new();
+        self.audio_attempt = Some(attempt.clone());
+        let (tx, rx) = catplay_util::oneshot::channel();
+        let sent = self.car.unbounded_send(TxAdapterOp::MirrorSetupAudio {
+            id: self.id.clone(),
+            attempt: attempt.clone(),
+            latency,
+            pcm_format,
+            response: tx,
+        });
+        let result = if sent.is_err() {
+            Err(RtspError::Closed)
+        } else {
+            match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(RtspError::Closed),
+                Err(_) => Err(RtspError::Timeout),
+            }
+        };
+        match result {
+            Ok(player) if self.id.is_active() && attempt.is_active() => Ok(Box::new(super::MirrorAudioPlayer::new(
+                player,
+                self.id.clone(),
+                attempt,
+                self.car.clone(),
+            ))),
+            result => {
+                attempt.retire();
+                let error = match result {
+                    Err(error) => error,
+                    Ok(player) => {
+                        // Retire the car guard before another actor can release
+                        // ownership and drain its teardown queue.
+                        drop(player);
+                        RtspError::Closed
+                    }
+                };
+                let _ = self.car.unbounded_send(TxAdapterOp::MirrorAudioEnded {
+                    id: self.id.clone(),
+                    attempt,
+                });
+                Err(error)
+            }
+        }
+    }
+    // Default open_microphone/open_iap2 reject or return None.
 }
 impl EventSleeper for MirrorRxSession {}
 impl EventReconciler for MirrorRxSession {

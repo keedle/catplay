@@ -57,6 +57,9 @@ pub enum AirPlayReceiverProfile {
     /// Opt-in picture-only mirroring experiment. No production listener selects it.
     #[cfg(feature = "experimental_airplay_mirroring")]
     AppleTVH264VideoOnly,
+    /// Opt-in H.264 screen mirroring with output audio bridged to the car.
+    #[cfg(feature = "experimental_airplay_mirroring")]
+    AppleTVH264Mirroring,
 }
 
 impl AirPlayReceiverProfile {
@@ -74,6 +77,21 @@ impl AirPlayReceiverProfile {
             return true;
         }
         false
+    }
+
+    pub(crate) fn is_experimental_mirroring(self) -> bool {
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        {
+            matches!(self, Self::AppleTVH264VideoOnly | Self::AppleTVH264Mirroring)
+        }
+        #[cfg(not(feature = "experimental_airplay_mirroring"))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn is_h264_only_screen(self) -> bool {
+        self.is_experimental_mirroring()
     }
 }
 
