@@ -115,8 +115,35 @@ pub struct AirPlayInitialSetupObservation {
     pub is_screen_mirroring_session: bool,
 }
 
+/// A fixed request-stage label for opt-in diagnostics. Never contains a URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirPlayReceiverRequestStage {
+    Options,
+    Info,
+    PairSetup,
+    PairVerify,
+    AuthSetup,
+    FpSetup,
+    Setup,
+    Record,
+    Teardown,
+    Unknown,
+}
+
+/// Coarse EOF class for diagnostics, with no underlying error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirPlayReceiverTransportClass {
+    Closed,
+    Timeout,
+    Transport,
+    Protocol,
+    Other,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AirPlayReceiverDiagnostic {
+    RequestOutcome { stage: AirPlayReceiverRequestStage, status: u16 },
+    ConnectionEnded(AirPlayReceiverTransportClass),
     UnsupportedInitialStreams,
     UnsupportedTimingProtocol,
     UnsupportedStreamSetup,

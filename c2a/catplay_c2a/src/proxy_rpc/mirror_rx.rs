@@ -6,7 +6,7 @@ use crate::{
 use async_trait::async_trait;
 use catplay_carplay::{
     carplay_rx::AIRPLAY_MIRRORING_MAX_SCREEN_PAYLOAD,
-    carplay_rx::{AirPlayReceiverHandleRef, AirPlayReceiverSink},
+    carplay_rx::{AirPlayInitialSetupObservation, AirPlayReceiverDiagnostic, AirPlayReceiverHandleRef, AirPlayReceiverSink},
     modes::ChangeModes,
     msg::{Command, Display, InfoMessageResponse},
     rtsp_frame::{RtspError, RtspResponse, RtspResult},
@@ -49,6 +49,8 @@ pub struct MirrorRxSession {
     screen_status: Option<super::MirrorStreamStatus>,
     car_pcm_formats: catplay_carplay::msg::AudioFormat,
     audio_attempt: Option<super::MirrorAudioAttempt>,
+    diagnostic_events: u8,
+    connection_ended_reported: bool,
 }
 impl MirrorRxSession {
     pub fn new(car: mpsc::UnboundedSender<TxAdapterOp>, options: MirroringOptions, width: u32, height: u32) -> Self {
@@ -62,6 +64,8 @@ impl MirrorRxSession {
             screen_status: None,
             car_pcm_formats: catplay_carplay::msg::AudioFormat::empty(),
             audio_attempt: None,
+            diagnostic_events: 0,
+            connection_ended_reported: false,
         }
     }
     pub fn with_audio_formats(mut self, car_pcm_formats: catplay_carplay::msg::AudioFormat) -> Self {
@@ -69,6 +73,10 @@ impl MirrorRxSession {
         self
     }
     fn finish(&mut self) {
+        if self.handle.is_some() {
+            #[cfg(feature = "experimental_airplay_mirroring")]
+            eprintln!("mirror_lifecycle stage=closed");
+        }
         self.id.retire();
         if let Some(attempt) = self.audio_attempt.take() {
             attempt.retire();
@@ -94,7 +102,51 @@ impl AirPlayReceiverSink for MirrorRxSession {
             })
             .map_err(|_| RtspError::Closed)?;
         self.handle = Some(handle);
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        eprintln!("mirror_lifecycle stage=admitted");
         Ok(())
+    }
+    fn on_receiver_diagnostic(&mut self, diagnostic: AirPlayReceiverDiagnostic) {
+        if let AirPlayReceiverDiagnostic::ConnectionEnded(class) = diagnostic {
+            if !self.connection_ended_reported {
+                self.connection_ended_reported = true;
+                #[cfg(feature = "experimental_airplay_mirroring")]
+                eprintln!("mirror_lifecycle stage=connection_ended class={class:?}");
+            }
+            return;
+        }
+        if self.diagnostic_events >= 32 {
+            return;
+        }
+        self.diagnostic_events += 1;
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        match diagnostic {
+            AirPlayReceiverDiagnostic::RequestOutcome { stage, status } => {
+                // This is the RTSP/HTTP transport status only. HAP can return HTTP 200
+                // with a TLV error, so it does not prove that authentication succeeded.
+                eprintln!("mirror_request stage={stage:?} transport_status={status}");
+            }
+            kind => eprintln!("mirror_diagnostic kind={kind:?}"),
+        }
+        #[cfg(not(feature = "experimental_airplay_mirroring"))]
+        let _ = diagnostic;
+    }
+    fn on_initial_setup_observation(&mut self, observation: AirPlayInitialSetupObservation) {
+        if self.diagnostic_events >= 32 {
+            return;
+        }
+        self.diagnostic_events += 1;
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        eprintln!(
+            "mirror_initial_setup timing={:?} stream_count={} stream_types={:?} encryption_type_bits={:?} screen_mirroring={}",
+            observation.timing_protocol,
+            observation.stream_count,
+            observation.stream_types.iter().take(8).collect::<Vec<_>>(),
+            observation.encryption_type_bits,
+            observation.is_screen_mirroring_session
+        );
+        #[cfg(not(feature = "experimental_airplay_mirroring"))]
+        let _ = observation;
     }
     fn init_modes(&mut self) -> ChangeModes {
         ChangeModes::default()
@@ -331,6 +383,26 @@ mod tests {
         let old = MirrorSessionId::new();
         assert!(old.matches(&old.clone()));
         assert!(!old.matches(&MirrorSessionId::new()));
+    }
+    #[test]
+    fn diagnostics_are_capped_per_connection_but_eof_is_reserved_once() {
+        let (tx, _rx) = mpsc::unbounded();
+        let mut sink = session(tx);
+        for _ in 0..40 {
+            sink.on_receiver_diagnostic(AirPlayReceiverDiagnostic::RequestOutcome {
+                stage: catplay_carplay::carplay_rx::AirPlayReceiverRequestStage::Unknown,
+                status: 404,
+            });
+        }
+        assert_eq!(sink.diagnostic_events, 32);
+        sink.on_receiver_diagnostic(AirPlayReceiverDiagnostic::ConnectionEnded(
+            catplay_carplay::carplay_rx::AirPlayReceiverTransportClass::Transport,
+        ));
+        sink.on_receiver_diagnostic(AirPlayReceiverDiagnostic::ConnectionEnded(
+            catplay_carplay::carplay_rx::AirPlayReceiverTransportClass::Transport,
+        ));
+        assert!(sink.connection_ended_reported);
+        assert_eq!(sink.diagnostic_events, 32);
     }
     #[test]
     fn uninitialized_sink_drop_does_not_disconnect_a_session() {

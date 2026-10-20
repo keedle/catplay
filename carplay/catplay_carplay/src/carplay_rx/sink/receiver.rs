@@ -22,7 +22,8 @@ use crate::{
     audio::codec::{AudioDecoder, AudioEncoder},
     carplay_rx::{
         AirPlayInitialSetupObservation, AirPlayObservedTimingProtocol, AirPlayReceiverDiagnostic, AirPlayReceiverHandleRef,
-        AirPlayReceiverProfile, AirPlayReceiverSessionError, AirPlayReceiverSinkBox,
+        AirPlayReceiverProfile, AirPlayReceiverRequestStage, AirPlayReceiverSessionError, AirPlayReceiverSinkBox,
+        AirPlayReceiverTransportClass,
         sink::{AirPlayReceiverHandleImpl, AirPlayServerShared, AirPlaySessionGuard},
     },
     cipher::AirPlayStreamEncryption,
@@ -39,7 +40,7 @@ use crate::{
     },
     pairing::PairingHelperRx,
     rtp::RtpReceiver,
-    rtsp_frame::{HttpHeader, HttpStatus, RtspError, RtspMethod::*, RtspQueue, RtspRequest, RtspResponse, RtspResult},
+    rtsp_frame::{HttpHeader, HttpStatus, RtspError, RtspMethod, RtspMethod::*, RtspQueue, RtspRequest, RtspResponse, RtspResult},
     rtsp_session::{RtspReceiverCallback, RtspReceiverEvent, RtspReceiverEventResult},
     screen::rx::ScreenReceiverSession,
 };
@@ -157,13 +158,27 @@ struct Streams {
 impl EventSink<RtspReceiverEvent<'_>, RtspReceiverEventResult> for AirPlayReceiver {
     async fn on_event<'a>(&mut self, event: RtspReceiverEvent<'a>) -> RtspReceiverEventResult {
         #[cfg(debug_assertions)]
-        trace!("Received event: {event:?}");
+        if self.profile.is_experimental_mirroring() {
+            trace!("Received experimental receiver event");
+        } else {
+            trace!("Received event: {event:?}");
+        }
 
         match event {
             RtspReceiverEvent::SetBindIp(bind_ip) => self.bind_ip = bind_ip,
             RtspReceiverEvent::SetPeerIp(peer_ip) => self.peer_ip = peer_ip,
             RtspReceiverEvent::Request { request, response } => {
-                if let Err(err) = self.process_request(request, response).await {
+                let result = self.process_request(request, response).await;
+                if self.profile.is_experimental_mirroring() {
+                    let stage = Self::diagnostic_request_stage(request.method, request.url.as_str());
+                    let status = result
+                        .as_ref()
+                        .map(|()| response.status.as_code())
+                        .unwrap_or_else(|error| error.to_code().as_code());
+                    self.sink
+                        .on_receiver_diagnostic(AirPlayReceiverDiagnostic::RequestOutcome { stage, status });
+                }
+                if let Err(err) = result {
                     return if let Some(key) = self.pairing.transition_pending_to_encrypted() {
                         self.state.change(AirPlayReceiverState::InitialSetup);
                         RtspReceiverEventResult::encrypt(Err(err), key)
@@ -180,7 +195,12 @@ impl EventSink<RtspReceiverEvent<'_>, RtspReceiverEventResult> for AirPlayReceiv
                 };
             }
             RtspReceiverEvent::Eof(err) => {
-                warn!("Observed EOF on RTSP stream! {err:?}");
+                if self.profile.is_experimental_mirroring() {
+                    self.sink
+                        .on_receiver_diagnostic(AirPlayReceiverDiagnostic::ConnectionEnded(Self::diagnostic_transport_class(&err)));
+                } else {
+                    warn!("Observed EOF on RTSP stream! {err:?}");
+                }
                 self.shutdown().await;
             }
         }
@@ -190,6 +210,39 @@ impl EventSink<RtspReceiverEvent<'_>, RtspReceiverEventResult> for AirPlayReceiv
 }
 
 impl RtspReceiverCallback for AirPlayReceiver {}
+
+impl AirPlayReceiver {
+    fn diagnostic_request_stage(method: RtspMethod, url: &str) -> AirPlayReceiverRequestStage {
+        match method {
+            RtspMethod::Options => AirPlayReceiverRequestStage::Options,
+            RtspMethod::Get | RtspMethod::Post if url == "/info" => AirPlayReceiverRequestStage::Info,
+            RtspMethod::Post if url == "/pair-setup" => AirPlayReceiverRequestStage::PairSetup,
+            RtspMethod::Post if url == "/pair-verify" => AirPlayReceiverRequestStage::PairVerify,
+            RtspMethod::Post if url == "/auth-setup" => AirPlayReceiverRequestStage::AuthSetup,
+            RtspMethod::Post if url == "/fp-setup" => AirPlayReceiverRequestStage::FpSetup,
+            RtspMethod::Setup => AirPlayReceiverRequestStage::Setup,
+            RtspMethod::Record => AirPlayReceiverRequestStage::Record,
+            RtspMethod::Teardown => AirPlayReceiverRequestStage::Teardown,
+            _ => AirPlayReceiverRequestStage::Unknown,
+        }
+    }
+
+    fn diagnostic_transport_class(error: &RtspError) -> AirPlayReceiverTransportClass {
+        match error {
+            RtspError::Closed | RtspError::UserClosing | RtspError::DisconnectNow => AirPlayReceiverTransportClass::Closed,
+            RtspError::Timeout | RtspError::KeepAliveTimeout => AirPlayReceiverTransportClass::Timeout,
+            RtspError::Io(_) | RtspError::Foreign(_) => AirPlayReceiverTransportClass::Transport,
+            RtspError::ProtocolViolationGeneric
+            | RtspError::ProtocolViolation(_)
+            | RtspError::ProtocolViolationString(_)
+            | RtspError::HeadersTooBig
+            | RtspError::PayloadTooBig(_, _)
+            | RtspError::PayloadTooShort(_, _)
+            | RtspError::UnparsablePlist(_) => AirPlayReceiverTransportClass::Protocol,
+            _ => AirPlayReceiverTransportClass::Other,
+        }
+    }
+}
 
 impl AsyncShutdown for AirPlayReceiver {
     async fn shutdown(&mut self) {
@@ -1418,6 +1471,49 @@ mod tests {
     use super::*;
     use catplay_hap::HomekitStorageFile;
     use std::sync::Mutex;
+
+    #[test]
+    fn experimental_diagnostics_remain_disabled_for_default_profiles() {
+        assert!(!AirPlayReceiverProfile::CarPlay.is_experimental_mirroring());
+        assert!(!AirPlayReceiverProfile::AppleTV.is_experimental_mirroring());
+        #[cfg(feature = "experimental_airplay_mirroring")]
+        assert!(AirPlayReceiverProfile::AppleTVH264VideoOnly.is_experimental_mirroring());
+    }
+
+    #[test]
+    fn diagnostic_request_stages_use_only_fixed_labels() {
+        use crate::rtsp_frame::RtspMethod;
+        use AirPlayReceiverRequestStage as Stage;
+
+        for (method, path, expected) in [
+            (RtspMethod::Options, "/anything?secret=1", Stage::Options),
+            (RtspMethod::Get, "/info", Stage::Info),
+            (RtspMethod::Post, "/pair-setup", Stage::PairSetup),
+            (RtspMethod::Post, "/pair-verify", Stage::PairVerify),
+            (RtspMethod::Post, "/auth-setup", Stage::AuthSetup),
+            (RtspMethod::Post, "/fp-setup", Stage::FpSetup),
+            (RtspMethod::Setup, "/secret?key=1", Stage::Setup),
+            (RtspMethod::Record, "/anything", Stage::Record),
+            (RtspMethod::Teardown, "/anything", Stage::Teardown),
+            (RtspMethod::Get, "/info?secret=1", Stage::Unknown),
+            (RtspMethod::Post, "/secret?key=1", Stage::Unknown),
+        ] {
+            assert_eq!(AirPlayReceiver::diagnostic_request_stage(method, path), expected);
+        }
+    }
+
+    #[test]
+    fn diagnostic_transport_classes_discard_error_details() {
+        use AirPlayReceiverTransportClass as Class;
+
+        assert_eq!(AirPlayReceiver::diagnostic_transport_class(&RtspError::Closed), Class::Closed);
+        assert_eq!(AirPlayReceiver::diagnostic_transport_class(&RtspError::Timeout), Class::Timeout);
+        assert_eq!(
+            AirPlayReceiver::diagnostic_transport_class(&RtspError::ProtocolViolation("secret path")),
+            Class::Protocol
+        );
+        assert_eq!(AirPlayReceiver::diagnostic_transport_class(&RtspError::NotSupported), Class::Other);
+    }
 
     #[derive(Default)]
     struct Calls {

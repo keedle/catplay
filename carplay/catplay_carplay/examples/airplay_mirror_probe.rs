@@ -111,6 +111,8 @@ struct ProbeSink {
     width: u32,
     height: u32,
     counters: Arc<Mutex<Counters>>,
+    diagnostic_events: u8,
+    connection_ended_reported: bool,
 }
 
 #[async_trait]
@@ -123,26 +125,47 @@ impl AirPlayReceiverSink for ProbeSink {
             handle.is_mirroring(),
             handle.is_car()
         ));
+        eprintln!("receiver_lifecycle stage=admitted");
         Ok(())
     }
 
     fn on_initial_setup_observation(&mut self, observation: AirPlayInitialSetupObservation) {
         let mut counters = self.counters.lock().unwrap();
         counters.initial_setups += 1;
-        counters.report(format_args!(
-            "initial_setup timing={:?} stream_count={} first_stream_types={:?} encryption_type_bits={:?} screen_mirroring={}",
-            observation.timing_protocol,
-            observation.stream_count,
-            observation.stream_types,
-            observation.encryption_type_bits,
-            observation.is_screen_mirroring_session
-        ));
+        if self.diagnostic_events < 32 {
+            self.diagnostic_events += 1;
+            counters.report(format_args!(
+                "initial_setup timing={:?} stream_count={} first_stream_types={:?} encryption_type_bits={:?} screen_mirroring={}",
+                observation.timing_protocol,
+                observation.stream_count,
+                observation.stream_types.iter().take(8).collect::<Vec<_>>(),
+                observation.encryption_type_bits,
+                observation.is_screen_mirroring_session
+            ));
+        }
     }
 
     fn on_receiver_diagnostic(&mut self, diagnostic: AirPlayReceiverDiagnostic) {
+        if let AirPlayReceiverDiagnostic::ConnectionEnded(class) = diagnostic {
+            if !self.connection_ended_reported {
+                self.connection_ended_reported = true;
+                self.counters.lock().unwrap().diagnostics += 1;
+                eprintln!("receiver_lifecycle stage=connection_ended class={class:?}");
+            }
+            return;
+        }
+        if self.diagnostic_events >= 32 {
+            return;
+        }
+        self.diagnostic_events += 1;
         let mut counters = self.counters.lock().unwrap();
         counters.diagnostics += 1;
-        counters.report(format_args!("receiver_diagnostic kind={diagnostic:?}"));
+        match diagnostic {
+            AirPlayReceiverDiagnostic::RequestOutcome { stage, status } => {
+                counters.report(format_args!("receiver_request stage={stage:?} transport_status={status}"))
+            }
+            kind => counters.report(format_args!("receiver_diagnostic kind={kind:?}")),
+        }
     }
 
     async fn on_info(&mut self, info: &mut InfoMessageResponse) {
@@ -288,6 +311,8 @@ async fn run(options: Options) -> Result<(), &'static str> {
             width: options.width,
             height: options.height,
             counters: sink_counters.clone(),
+            diagnostic_events: 0,
+            connection_ended_reported: false,
         },
     );
     server.bind().await.map_err(|_| "bind")?;
