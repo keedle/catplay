@@ -1,0 +1,17 @@
+{
+  "generator": "local GStreamer x264enc bframes=2 synthetic fixture",
+  "source_access_unit_sha256": "aad3a7ff9d7f43225ca9b2196d791ec8e8beca64c7817eed9334a68e4dec577d",
+  "profile_idc": 77,
+  "level_idc": 31,
+  "nal_types": [
+    9,
+    7,
+    8,
+    6,
+    5
+  ],
+  "config_bytes": 42,
+  "idr_bytes": 8047,
+  "config_sha256": "4996696d3dee18fcbe19daf57e3dd48d5fd698e993120f72f86c11d7b9f3aeca",
+  "idr_sha256": "938bf119fd15d12bcdce8277a880a290a457bd58cc0ff67c66b3367b2e463321"
+}
