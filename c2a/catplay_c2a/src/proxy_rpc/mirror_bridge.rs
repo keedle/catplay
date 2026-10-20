@@ -89,6 +89,10 @@ impl MirrorBridge {
                 state: state.clone(),
                 producer_notify: producer_notify.clone(),
                 consumer_notify: consumer_notify.clone(),
+                config_summary_emitted: false,
+                diagnostics_enabled: false,
+                first_accepted_video_frame_reported: false,
+                first_accepted_idr_reported: false,
             },
             MirrorBridgeReceiver {
                 state,
@@ -130,6 +134,10 @@ pub struct MirrorBridgeSink {
     state: Arc<Mutex<BridgeState>>,
     producer_notify: Arc<Notify>,
     consumer_notify: Arc<Notify>,
+    config_summary_emitted: bool,
+    diagnostics_enabled: bool,
+    first_accepted_video_frame_reported: bool,
+    first_accepted_idr_reported: bool,
 }
 
 /// Consumer side owned by the connected-car event loop.
@@ -294,6 +302,10 @@ impl ScreenReceiverSink for MirrorBridgeSink {
             self.consumer_notify.notify_one();
             state.limits
         };
+        if self.diagnostics_enabled && !self.config_summary_emitted {
+            eprintln!("{}", config_summary_line(&config, limits));
+            self.config_summary_emitted = true;
+        }
         if let Err(err) = validate_config(&config, limits) {
             return Err(err);
         }
@@ -369,10 +381,11 @@ impl ScreenReceiverSink for MirrorBridgeSink {
         }
 
         frame.is_keyframe = Some(is_idr);
+        let mut frame = Some(frame);
         loop {
             // Register before checking the slot to avoid missing a consumer wake.
             let notified = self.producer_notify.notified();
-            {
+            let accepted = {
                 let mut state = self.state.lock().unwrap();
                 if state.closed {
                     return Err(closed_error());
@@ -380,20 +393,38 @@ impl ScreenReceiverSink for MirrorBridgeSink {
                 if state.revision != accepted_revision {
                     return Ok(());
                 }
-                if is_idr && state.config.as_ref() != frame.config.as_ref() {
+                if is_idr && state.config.as_ref() != frame.as_ref().and_then(|frame| frame.config.as_ref()) {
                     return Err(RtspError::ProtocolViolation("stale mirror generation config"));
                 }
                 if state.needs_idr && !is_idr {
                     return Ok(());
                 }
                 if state.pending.is_none() {
+                    let Some(frame) = frame.take() else {
+                        return Ok(());
+                    };
                     state.pending = Some(frame);
                     state.pending_revision = state.revision;
                     state.needs_idr = false;
                     state.idr_wait = None;
                     self.consumer_notify.notify_one();
-                    return Ok(());
+                    let report_video = self.diagnostics_enabled && !self.first_accepted_video_frame_reported;
+                    let report_idr = self.diagnostics_enabled && is_idr && !self.first_accepted_idr_reported;
+                    self.first_accepted_video_frame_reported |= report_video;
+                    self.first_accepted_idr_reported |= report_idr;
+                    Some((report_video, report_idr))
+                } else {
+                    None
                 }
+            };
+            if let Some((report_video, report_idr)) = accepted {
+                if report_video {
+                    eprintln!("first_accepted_video_frame");
+                }
+                if report_idr {
+                    eprintln!("first_accepted_idr");
+                }
+                return Ok(());
             }
             if tokio::time::timeout(PUBLISH_TIMEOUT, notified)
                 .await
@@ -418,6 +449,11 @@ impl ScreenReceiverSink for MirrorBridgeSink {
 }
 
 impl MirrorBridgeSink {
+    pub fn with_experimental_diagnostics(mut self) -> Self {
+        self.diagnostics_enabled = true;
+        self
+    }
+
     fn ensure_open(&self) -> RtspResult<()> {
         if self.state.lock().unwrap().closed {
             Err(closed_error())
@@ -502,6 +538,44 @@ fn idr_wait_state(state: &BridgeState) -> MirrorIdrWaitState {
                 MirrorIdrWaitState::Streaming
             })
     }
+}
+
+fn first_sps_header(bytes: &[u8]) -> Option<(u8, u8, u8)> {
+    let mut offset = 0usize;
+    while offset.checked_add(4)? <= bytes.len() {
+        if !bytes[offset..].starts_with(&[0, 0, 0, 1]) {
+            return None;
+        }
+        let start = offset + 4;
+        let end = bytes[start..]
+            .windows(4)
+            .position(|window| window == [0, 0, 0, 1])
+            .map(|relative| start + relative)
+            .unwrap_or(bytes.len());
+        let nal = &bytes[start..end];
+        if nal.first().is_some_and(|header| header & 0x80 == 0 && header & 0x1f == 7) {
+            return Some((*nal.get(1)?, *nal.get(2)?, *nal.get(3)?));
+        }
+        offset = end;
+    }
+    None
+}
+
+fn config_summary_line(config: &AvccConfigExtended, limits: MirrorLimits) -> String {
+    let (profile, constraints, level) = first_sps_header(&config.avcc.sps_pps)
+        .map(|(profile, constraints, level)| (Some(profile), Some(constraints), Some(level)))
+        .unwrap_or((None, None, None));
+    format!(
+        "mirror_config observed_width={} observed_height={} hevc={} nal_size_len={} sps_profile_idc={profile:?} sps_constraint_flags={constraints:?} sps_level_idc={level:?} expected_width={} expected_height={} expected_profile_idc={} expected_level_idc={}",
+        config.width,
+        config.height,
+        config.hevc,
+        config.avcc.nal_size_len,
+        limits.width,
+        limits.height,
+        limits.profile_idc,
+        limits.level_idc,
+    )
 }
 
 fn validate_config(config: &AvccConfigExtended, limits: MirrorLimits) -> RtspResult<()> {
@@ -674,6 +748,51 @@ mod tests {
             height: 480,
             respect_timestamps: true,
         }
+    }
+
+    #[test]
+    fn first_sps_header_and_config_summary_are_numeric_and_bounded() {
+        let config = config();
+        assert_eq!(first_sps_header(&config.avcc.sps_pps), Some((66, 0, 30)));
+        assert_eq!(first_sps_header(&[0, 0, 0, 1, 0x68, 0]), None);
+        let line = config_summary_line(&config, limits());
+        assert_eq!(
+            line,
+            "mirror_config observed_width=800 observed_height=480 hevc=false nal_size_len=4 sps_profile_idc=Some(66) sps_constraint_flags=Some(0) sps_level_idc=Some(30) expected_width=800 expected_height=480 expected_profile_idc=66 expected_level_idc=30"
+        );
+        assert!(line.len() <= 256);
+        assert!(!line.contains("0x67"));
+        assert!(!line.contains("0x68"));
+    }
+
+    #[tokio::test]
+    async fn config_summary_is_emitted_at_most_once_per_bridge_stream() {
+        let (sink, _receiver) = MirrorBridge::new(limits());
+        let mut sink = sink.with_experimental_diagnostics();
+        assert!(!sink.config_summary_emitted);
+        sink.set_avcc_config(config()).await.unwrap();
+        assert!(sink.config_summary_emitted);
+        sink.set_avcc_config(config()).await.unwrap();
+        assert!(sink.config_summary_emitted);
+    }
+
+    #[tokio::test]
+    async fn first_frame_and_idr_diagnostics_follow_bridge_admission_once() {
+        let (sink, mut receiver) = MirrorBridge::new(limits());
+        let mut sink = sink.with_experimental_diagnostics();
+        sink.set_avcc_config(config()).await.unwrap();
+        assert!(!sink.first_accepted_video_frame_reported);
+        assert!(!sink.first_accepted_idr_reported);
+        sink.process_frame(frame(&[&[0x41, 0x80]])).await.unwrap();
+        assert!(!sink.first_accepted_video_frame_reported);
+        assert!(!sink.first_accepted_idr_reported);
+        sink.process_frame(frame(&[&[0x65, 0x80]])).await.unwrap();
+        assert!(sink.first_accepted_video_frame_reported);
+        assert!(sink.first_accepted_idr_reported);
+        assert!(receiver.take_frame().is_some());
+        sink.process_frame(frame(&[&[0x65, 0x80]])).await.unwrap();
+        assert!(sink.first_accepted_video_frame_reported);
+        assert!(sink.first_accepted_idr_reported);
     }
 
     fn frame(nals: &[&[u8]]) -> EncodedVideoFrame {

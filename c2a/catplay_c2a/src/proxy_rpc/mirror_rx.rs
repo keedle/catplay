@@ -209,6 +209,7 @@ impl AirPlayReceiverSink for MirrorRxSession {
             AIRPLAY_MIRRORING_MAX_SCREEN_PAYLOAD,
         )?;
         let (sink, receiver) = MirrorBridge::new(limits);
+        let sink = sink.with_experimental_diagnostics();
         self.screen_status = Some(receiver.stream_status());
         self.car
             .unbounded_send(TxAdapterOp::MirrorScreen {

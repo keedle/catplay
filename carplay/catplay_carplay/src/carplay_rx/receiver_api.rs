@@ -140,6 +140,22 @@ pub enum AirPlayReceiverTransportClass {
     Other,
 }
 
+/// Fixed, non-sensitive categories for experimental screen stream termination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirPlayScreenTerminationClass {
+    ConfigParse,
+    HevcUnsupported,
+    NalLengthUnsupported,
+    DimensionMismatch,
+    ProfileLevelMismatch,
+    ParameterSetsInvalid,
+    FramePolicy,
+    CryptoOrTransport,
+    AcceptOrScreenTimeout,
+    OtherProtocol,
+    ClosedOrOther,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AirPlayReceiverDiagnostic {
     RequestOutcome { stage: AirPlayReceiverRequestStage, status: u16 },
@@ -150,7 +166,7 @@ pub enum AirPlayReceiverDiagnostic {
     AudioUnsupported,
     MissingMediaEncryption,
     InitialSetupFailed,
-    ScreenTerminated,
+    ScreenTerminated(AirPlayScreenTerminationClass),
     ScreenPayloadTooLarge,
     // A completed handler is only one request, not proof of authentication or
     // an established AirPlay session. HAP can return a TLV error with HTTP 200.

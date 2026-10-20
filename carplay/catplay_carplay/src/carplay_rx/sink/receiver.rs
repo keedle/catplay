@@ -23,7 +23,7 @@ use crate::{
     carplay_rx::{
         AirPlayInitialSetupObservation, AirPlayObservedTimingProtocol, AirPlayReceiverDiagnostic, AirPlayReceiverHandleRef,
         AirPlayReceiverProfile, AirPlayReceiverRequestStage, AirPlayReceiverSessionError, AirPlayReceiverSinkBox,
-        AirPlayReceiverTransportClass,
+        AirPlayReceiverTransportClass, AirPlayScreenTerminationClass,
         sink::{AirPlayReceiverHandleImpl, AirPlayServerShared, AirPlaySessionGuard},
     },
     cipher::AirPlayStreamEncryption,
@@ -212,6 +212,60 @@ impl EventSink<RtspReceiverEvent<'_>, RtspReceiverEventResult> for AirPlayReceiv
 impl RtspReceiverCallback for AirPlayReceiver {}
 
 impl AirPlayReceiver {
+    fn screen_termination_class(error: Option<&RtspError>) -> AirPlayScreenTerminationClass {
+        use AirPlayScreenTerminationClass as Class;
+        match error {
+            None | Some(RtspError::Closed | RtspError::UserClosing | RtspError::DisconnectNow) => Class::ClosedOrOther,
+            Some(RtspError::ProtocolViolation("mirror bridge generation is closed")) => Class::ClosedOrOther,
+            Some(RtspError::Timeout) => Class::AcceptOrScreenTimeout,
+            Some(RtspError::Crypto(_) | RtspError::Io(_) | RtspError::Foreign(_) | RtspError::KeepAliveTimeout) => Class::CryptoOrTransport,
+            Some(RtspError::ProtocolViolation("received unparsable VideoConfig frame")) => Class::ConfigParse,
+            Some(RtspError::ProtocolViolation(
+                "mirror bridge accepts H264 only" | "picture-only mirroring does not support HEVC",
+            )) => Class::HevcUnsupported,
+            Some(RtspError::ProtocolViolation(
+                "mirror bridge requires four-byte AVCC lengths" | "picture-only mirroring requires four-byte NAL lengths",
+            )) => Class::NalLengthUnsupported,
+            Some(RtspError::ProtocolViolation(
+                "mirror dimensions do not match explicit target limits"
+                | "picture-only mirroring requires nonzero coded dimensions",
+            )) => Class::DimensionMismatch,
+            Some(RtspError::ProtocolViolation("H264 profile or level exceeds explicit target policy")) => Class::ProfileLevelMismatch,
+            Some(RtspError::ProtocolViolation(
+                "H264 parameter sets exceed explicit byte limits"
+                | "invalid H264 parameter-set framing"
+                | "invalid H264 parameter set"
+                | "config must contain only valid H264 SPS and PPS"
+                | "H264 config requires both SPS and PPS",
+            )) => Class::ParameterSetsInvalid,
+            Some(RtspError::ProtocolViolation(
+                "received VideoFrame before VideoConfig"
+                | "mirror frame arrived before accepted H264 config"
+                | "mirror frame config changed without reconfiguration"
+                | "timed out waiting for mirror IDR"
+                | "mirror frame exceeds explicit target limits"
+                | "mirror frame exceeds explicit byte limits"
+                | "stale mirror generation config"
+                | "empty H264 access unit"
+                | "invalid Annex B NAL start code"
+                | "too many H264 NALs in access unit"
+                | "empty H264 NAL"
+                | "invalid H264 NAL header"
+                | "invalid or empty H264 IDR NAL"
+                | "in-band H264 SPS/PPS changes are not supported"
+                | "unsupported H264 NAL type"
+                | "mixed IDR and non-IDR slices in H264 access unit",
+            )) => Class::FramePolicy,
+            Some(
+                RtspError::ProtocolViolation(_)
+                | RtspError::ProtocolViolationString(_)
+                | RtspError::ProtocolViolationGeneric
+                | RtspError::Code(_),
+            ) => Class::OtherProtocol,
+            Some(_) => Class::ClosedOrOther,
+        }
+    }
+
     fn diagnostic_request_stage(method: RtspMethod, url: &str) -> AirPlayReceiverRequestStage {
         match method {
             RtspMethod::Options => AirPlayReceiverRequestStage::Options,
@@ -339,7 +393,7 @@ impl AirPlayReceiver {
                 .on_receiver_diagnostic(if matches!(&error, Some(RtspError::PayloadTooBig(..))) {
                     AirPlayReceiverDiagnostic::ScreenPayloadTooLarge
                 } else {
-                    AirPlayReceiverDiagnostic::ScreenTerminated
+                    AirPlayReceiverDiagnostic::ScreenTerminated(Self::screen_termination_class(error.as_ref()))
                 });
             return Err(error.unwrap_or(RtspError::Closed));
         }
@@ -979,7 +1033,8 @@ impl AirPlayReceiver {
             latency,
             screen_sink,
             media_clock.boxed(),
-        );
+        )
+        .with_experimental_diagnostics(self.profile.is_experimental_mirroring());
         #[cfg(feature = "experimental_airplay_mirroring")]
         let recv = if self.profile.is_h264_only_screen() {
             recv.with_max_payload_size(crate::carplay_rx::AIRPLAY_MIRRORING_MAX_SCREEN_PAYLOAD)?
@@ -1513,6 +1568,58 @@ mod tests {
             Class::Protocol
         );
         assert_eq!(AirPlayReceiver::diagnostic_transport_class(&RtspError::NotSupported), Class::Other);
+    }
+
+    #[test]
+    fn screen_termination_errors_map_to_fixed_non_sensitive_classes() {
+        use AirPlayScreenTerminationClass as Class;
+
+        let cases = [
+            (RtspError::ProtocolViolation("received unparsable VideoConfig frame"), Class::ConfigParse),
+            (RtspError::ProtocolViolation("mirror bridge accepts H264 only"), Class::HevcUnsupported),
+            (
+                RtspError::ProtocolViolation("picture-only mirroring does not support HEVC"),
+                Class::HevcUnsupported,
+            ),
+            (
+                RtspError::ProtocolViolation("mirror bridge requires four-byte AVCC lengths"),
+                Class::NalLengthUnsupported,
+            ),
+            (
+                RtspError::ProtocolViolation("picture-only mirroring requires four-byte NAL lengths"),
+                Class::NalLengthUnsupported,
+            ),
+            (
+                RtspError::ProtocolViolation("mirror dimensions do not match explicit target limits"),
+                Class::DimensionMismatch,
+            ),
+            (
+                RtspError::ProtocolViolation("picture-only mirroring requires nonzero coded dimensions"),
+                Class::DimensionMismatch,
+            ),
+            (
+                RtspError::ProtocolViolation("H264 profile or level exceeds explicit target policy"),
+                Class::ProfileLevelMismatch,
+            ),
+            (RtspError::ProtocolViolation("invalid H264 parameter set"), Class::ParameterSetsInvalid),
+            (RtspError::ProtocolViolation("timed out waiting for mirror IDR"), Class::FramePolicy),
+            (RtspError::KeepAliveTimeout, Class::CryptoOrTransport),
+            (RtspError::Timeout, Class::AcceptOrScreenTimeout),
+            (RtspError::Closed, Class::ClosedOrOther),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(AirPlayReceiver::screen_termination_class(Some(&error)), expected);
+        }
+        assert_eq!(AirPlayReceiver::screen_termination_class(None), Class::ClosedOrOther);
+
+        let secret = RtspError::ProtocolViolationString("credential=secret-value".into());
+        let class = AirPlayReceiver::screen_termination_class(Some(&secret));
+        assert_eq!(class, Class::OtherProtocol);
+        assert!(!format!("{class:?}").contains("secret-value"));
+        let unknown_static = RtspError::ProtocolViolation("credential=secret-value");
+        let class = AirPlayReceiver::screen_termination_class(Some(&unknown_static));
+        assert_eq!(class, Class::OtherProtocol);
+        assert!(!format!("{class:?}").contains("secret-value"));
     }
 
     #[derive(Default)]
