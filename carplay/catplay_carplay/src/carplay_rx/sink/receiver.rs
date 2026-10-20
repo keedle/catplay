@@ -241,6 +241,7 @@ impl AirPlayReceiver {
             Some(RtspError::ProtocolViolation(
                 "received VideoFrame before VideoConfig"
                 | "mirror frame arrived before accepted H264 config"
+                | "mirror frame geometry does not match accepted config"
                 | "mirror frame config changed without reconfiguration"
                 | "timed out waiting for mirror IDR"
                 | "mirror frame exceeds explicit target limits"
@@ -1603,6 +1604,10 @@ mod tests {
             ),
             (RtspError::ProtocolViolation("invalid H264 parameter set"), Class::ParameterSetsInvalid),
             (RtspError::ProtocolViolation("timed out waiting for mirror IDR"), Class::FramePolicy),
+            (
+                RtspError::ProtocolViolation("mirror frame geometry does not match accepted config"),
+                Class::FramePolicy,
+            ),
             (RtspError::KeepAliveTimeout, Class::CryptoOrTransport),
             (RtspError::Timeout, Class::AcceptOrScreenTimeout),
             (RtspError::Closed, Class::ClosedOrOther),

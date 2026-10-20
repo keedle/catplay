@@ -26,9 +26,9 @@ pub const MIRROR_IDR_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 static NEXT_GENERATION: AtomicUsize = AtomicUsize::new(1);
 const MAX_ACCESS_UNIT_NALS: usize = 4096;
 
-/// Explicit receiver limits. Width and height must match the advertised
-/// transport dimensions exactly; profile and level come from an explicit
-/// policy. SPS parsing here checks only the profile and level header bytes.
+/// Explicit receiver limits. Transport-reported dimensions must be nonzero and
+/// no larger than advertised transport dimensions. Profile and level come from
+/// an explicit policy. SPS parsing checks only profile and level header bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MirrorLimits {
     pub width: u32,
@@ -322,7 +322,7 @@ impl ScreenReceiverSink for MirrorBridgeSink {
     }
 
     async fn process_frame(&mut self, mut frame: EncodedVideoFrame) -> RtspResult<()> {
-        let (limits, needs_idr, accepted_revision) = {
+        let (limits, accepted_width, accepted_height, needs_idr, accepted_revision) = {
             let state = self.state.lock().unwrap();
             if state.closed {
                 return Err(closed_error());
@@ -345,9 +345,12 @@ impl ScreenReceiverSink for MirrorBridgeSink {
             {
                 return Err(RtspError::ProtocolViolation("timed out waiting for mirror IDR"));
             }
-            (state.limits, state.needs_idr, state.revision)
+            (state.limits, config.width, config.height, state.needs_idr, state.revision)
         };
-        if frame.width != limits.width || frame.height != limits.height || frame.data.len() > limits.max_frame_bytes {
+        if frame.width != accepted_width || frame.height != accepted_height {
+            return Err(RtspError::ProtocolViolation("mirror frame geometry does not match accepted config"));
+        }
+        if frame.width > limits.width || frame.height > limits.height || frame.data.len() > limits.max_frame_bytes {
             return Err(RtspError::ProtocolViolation("mirror frame exceeds explicit target limits"));
         }
         let is_idr = validate_access_unit(&frame.data)?;
@@ -585,7 +588,7 @@ fn validate_config(config: &AvccConfigExtended, limits: MirrorLimits) -> RtspRes
     if config.avcc.nal_size_len != 4 {
         return Err(RtspError::ProtocolViolation("mirror bridge requires four-byte AVCC lengths"));
     }
-    if config.width != limits.width || config.height != limits.height {
+    if config.width == 0 || config.height == 0 || config.width > limits.width || config.height > limits.height {
         return Err(RtspError::ProtocolViolation(
             "mirror dimensions do not match explicit target limits",
         ));
@@ -613,7 +616,12 @@ fn validate_config(config: &AvccConfigExtended, limits: MirrorLimits) -> RtspRes
         match nal[0] & 0x1f {
             7 if nal.len() >= 4 => {
                 has_sps = true;
-                if nal[1] != limits.profile_idc || nal[3] != limits.level_idc {
+                let expected_level_matches = if limits.profile_idc == 100 && limits.level_idc == 31 {
+                    matches!(nal[3], 30 | 31)
+                } else {
+                    nal[3] == limits.level_idc
+                };
+                if nal[1] != limits.profile_idc || !expected_level_matches {
                     return Err(RtspError::ProtocolViolation("H264 profile or level exceeds explicit target policy"));
                 }
             }
@@ -736,6 +744,10 @@ mod tests {
         MirrorLimits::new(800, 480, 66, 30, 1024).unwrap()
     }
 
+    fn high_limits() -> MirrorLimits {
+        MirrorLimits::new(1200, 720, 100, 31, 1024).unwrap()
+    }
+
     fn config() -> AvccConfigExtended {
         AvccConfigExtended {
             hevc: false,
@@ -746,6 +758,20 @@ mod tests {
             video_latency: Duration::ZERO,
             width: 800,
             height: 480,
+            respect_timestamps: true,
+        }
+    }
+
+    fn high_config() -> AvccConfigExtended {
+        AvccConfigExtended {
+            hevc: false,
+            avcc: AvccConfig {
+                nal_size_len: 4,
+                sps_pps: vec![0, 0, 0, 1, 0x67, 100, 0, 30, 0, 0, 0, 1, 0x68, 0],
+            },
+            video_latency: Duration::ZERO,
+            width: 332,
+            height: 720,
             respect_timestamps: true,
         }
     }
@@ -763,6 +789,55 @@ mod tests {
         assert!(line.len() <= 256);
         assert!(!line.contains("0x67"));
         assert!(!line.contains("0x68"));
+    }
+
+    #[tokio::test]
+    async fn accepts_bounded_high_level_30_and_rejects_invalid_dimensions_profile_or_levels() {
+        validate_config(&config(), limits()).unwrap();
+        let valid = high_config();
+        validate_config(&valid, high_limits()).unwrap();
+        let (mut sink, _receiver) = MirrorBridge::new(high_limits());
+        sink.set_avcc_config(valid.clone()).await.unwrap();
+
+        let mut level_31 = valid.clone();
+        level_31.avcc.sps_pps[7] = 31;
+        validate_config(&level_31, high_limits()).unwrap();
+        sink.set_avcc_config(level_31).await.unwrap();
+
+        for invalid in [
+            AvccConfigExtended { width: 0, ..valid.clone() },
+            AvccConfigExtended { height: 0, ..valid.clone() },
+            AvccConfigExtended { width: 1201, ..valid.clone() },
+            AvccConfigExtended { height: 721, ..valid.clone() },
+        ] {
+            assert!(validate_config(&invalid, high_limits()).is_err());
+        }
+
+        let mut wrong_profile = valid.clone();
+        wrong_profile.avcc.sps_pps[5] = 66;
+        assert!(validate_config(&wrong_profile, high_limits()).is_err());
+
+        for level in [29, 32] {
+            let mut unsupported_level = valid.clone();
+            unsupported_level.avcc.sps_pps[7] = level;
+            assert!(validate_config(&unsupported_level, high_limits()).is_err());
+        }
+
+        let mut baseline_wrong_level = config();
+        baseline_wrong_level.avcc.sps_pps[7] = 31;
+        assert!(validate_config(&baseline_wrong_level, limits()).is_err());
+    }
+
+    #[test]
+    fn screen_config_round_trip_preserves_submax_geometry_and_original_sps_bytes() {
+        let config = high_config();
+        let original_sps_pps = config.avcc.sps_pps.clone();
+        let screen_config = ScreenFrame::config(&config);
+        assert_eq!(screen_config.header.params[1].as_f32_floor(), (332, 720));
+        let decoded = screen_config.config_decode(Duration::ZERO).unwrap();
+        assert_eq!((decoded.width, decoded.height), (332, 720));
+        assert_eq!(decoded.avcc.sps_pps, original_sps_pps);
+        assert_eq!(decoded.avcc.sps_pps[7], 30);
     }
 
     #[tokio::test]
@@ -795,7 +870,55 @@ mod tests {
         assert!(sink.first_accepted_idr_reported);
     }
 
+    #[tokio::test]
+    async fn rejects_frame_geometry_that_differs_from_accepted_config() {
+        let config = high_config();
+        let (mut sink, mut receiver) = MirrorBridge::new(high_limits());
+        sink.set_avcc_config(config.clone()).await.unwrap();
+        let mut mismatched = frame_for_config(&config, &[&[0x65, 0x80]]);
+        mismatched.width = 333;
+        assert!(matches!(
+            sink.process_frame(mismatched).await,
+            Err(RtspError::ProtocolViolation("mirror frame geometry does not match accepted config"))
+        ));
+        assert!(receiver.take_frame().is_none());
+    }
+
+    #[tokio::test]
+    async fn geometry_reconfiguration_invalidates_old_frame_and_requires_new_idr() {
+        let old_config = AvccConfigExtended {
+            width: 800,
+            height: 480,
+            ..high_config()
+        };
+        let new_config = high_config();
+        let (mut sink, mut receiver) = MirrorBridge::new(high_limits());
+        sink.set_avcc_config(old_config.clone()).await.unwrap();
+        sink.process_frame(frame_for_config(&old_config, &[&[0x65, 0x80]])).await.unwrap();
+        let (old_revision, _) = receiver.take_frame_tagged().unwrap();
+
+        sink.set_avcc_config(new_config.clone()).await.unwrap();
+        assert!(!receiver.is_revision_current(old_revision));
+        assert!(receiver.take_frame().is_none());
+        let mut stale_old_geometry = frame_for_config(&old_config, &[&[0x65, 0x80]]);
+        stale_old_geometry.config = None;
+        assert!(matches!(
+            sink.process_frame(stale_old_geometry).await,
+            Err(RtspError::ProtocolViolation("mirror frame geometry does not match accepted config"))
+        ));
+
+        sink.process_frame(frame_for_config(&new_config, &[&[0x41, 0x80]])).await.unwrap();
+        assert!(receiver.take_frame().is_none());
+        assert_eq!(receiver.idr_wait_state(), MirrorIdrWaitState::WaitingInitialIdr);
+        sink.process_frame(frame_for_config(&new_config, &[&[0x65, 0x80]])).await.unwrap();
+        assert_eq!(receiver.take_frame().unwrap().config, Some(new_config));
+    }
+
     fn frame(nals: &[&[u8]]) -> EncodedVideoFrame {
+        frame_for_config(&config(), nals)
+    }
+
+    fn frame_for_config(config: &AvccConfigExtended, nals: &[&[u8]]) -> EncodedVideoFrame {
         let mut data = BytesMut::new();
         for nal in nals {
             data.extend_from_slice(&[0, 0, 0, 1]);
@@ -803,10 +926,10 @@ mod tests {
         }
         EncodedVideoFrame {
             pts: Pts(Instant::now()),
-            width: 800,
-            height: 480,
+            width: config.width,
+            height: config.height,
             data,
-            config: Some(config()),
+            config: Some(config.clone()),
             nal_offsets: None,
             is_keyframe: Some(false),
             header_buf: BytesMut::new(),
@@ -952,7 +1075,7 @@ mod tests {
         sink.set_avcc_config(config()).await.unwrap();
         sink.process_frame(frame(&[&[0x65, 0x80]])).await.unwrap();
         let (revision, _frame) = receiver.take_frame_tagged().unwrap();
-        let invalid = AvccConfigExtended { width: 640, ..config() };
+        let invalid = AvccConfigExtended { width: 801, ..config() };
         assert!(sink.set_avcc_config(invalid).await.is_err());
         assert!(!receiver.is_revision_current(revision));
         assert!(sink.process_frame(frame(&[&[0x65, 0x80]])).await.is_err());
